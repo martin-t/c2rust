@@ -1641,6 +1641,24 @@ impl Builder {
         )
     }
 
+    pub fn mac_item2<I, M>(self, name: I, mac: M) -> P<Item>
+    where
+        I: Make<Ident>,
+        M: Make<Mac>,
+    {
+        let name = name.make(&self);
+        let mac = mac.make(&self);
+        let kind = ItemKind::Mac(mac);
+        Self::item(
+            name,
+            self.attrs,
+            self.vis,
+            self.span,
+            self.id,
+            kind,
+        )
+    }
+
     pub fn variant<I>(self, name: I, dat: VariantData) -> Variant
     where
         I: Make<Ident>,
