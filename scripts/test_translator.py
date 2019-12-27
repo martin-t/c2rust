@@ -72,6 +72,7 @@ class CFile:
         self.disallow_current_block = "disallow_current_block" in flags
         self.translate_const_macros = "translate_const_macros" in flags
         self.reorganize_definitions = "reorganize_definitions" in flags
+        self.emit_build_files = "emit_build_files" in flags
 
     def translate(self, cc_db, extra_args: List[str] = []) -> RustFile:
         extensionless_file, _ = os.path.splitext(self.path)
@@ -99,6 +100,8 @@ class CFile:
             args.append("--translate-const-macros")
         if self.reorganize_definitions:
             args.append("--reorganize-definitions")
+        if self.emit_build_files:
+            args.append("--emit-build-files")
 
         if self.logLevel == 'DEBUG':
             args.append("--log-level=debug")
@@ -261,7 +264,7 @@ class TestDirectory:
             file_flags = {flag.strip() for flag in flags_str.split(',')}
 
         found_tests = re.findall(
-            r"(//(.*))?\npub fn (test_\w+)\(\)", file_buffer)
+            r"(//(.*))?\n\s*pub fn (test_\w+)\(\)", file_buffer)
         test_fns = []
 
         for _, config, test_name in found_tests:
@@ -355,9 +358,10 @@ class TestDirectory:
             "stdsimd",
             "const_transmute",
             "nll",
-            "custom_attribute",
             "linkage",
+            "register_tool",
         ])
+        rust_file_builder.add_pragma("register_tool", ["c2rust"])
 
         # .c -> .rs
         for c_file in self.c_files:
@@ -383,6 +387,11 @@ class TestDirectory:
                 continue
 
             self.generated_files["rust_src"].append(translated_rust_file)
+            if c_file.emit_build_files:
+                self.generated_files["rust_src"].append(self.full_path + "/src/Cargo.toml")
+                self.generated_files["rust_src"].append(self.full_path + "/src/build.rs")
+                self.generated_files["rust_src"].append(self.full_path + "/src/c2rust-lib.rs")
+                self.generated_files["rust_src"].append(self.full_path + "/src/rust-toolchain")
 
             _, rust_file_short = os.path.split(translated_rust_file.path)
             extensionless_rust_file, _ = os.path.splitext(rust_file_short)

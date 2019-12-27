@@ -1,23 +1,33 @@
+require 'pl'
+
 refactor:transform(
    function(transform)
       return transform:match(
          function(mcx)
-            pat = mcx:parse_stmts([[
+            local pat = mcx:parse_stmts([[
 $i:Ident = $start:Expr;
 $'label:?Ident: while $cond:Expr {
     $body:MultiStmt;
     $incr:Stmt;
 }]])
-            lt_cond = mcx:parse_expr("$i < $end:Expr")
-            le_cond = mcx:parse_expr("$i <= $end:Expr")
+            local lt_cond = mcx:parse_expr("$i < $end:Expr")
+            local le_cond = mcx:parse_expr("$i <= $end:Expr")
 
-            i_plus_eq = mcx:parse_expr("$i += $step:Expr")
-            i_eq_plus = mcx:parse_expr("$i = $i + $step:Expr")
+            local i_plus_eq = mcx:parse_expr("$i += $step:Expr")
+            local i_eq_plus = mcx:parse_expr("$i = $i + $step:Expr")
 
-            range_one_excl = mcx:parse_stmts("$'label: for $i in $start .. $end { $body; }")
-            range_one_incl = mcx:parse_stmts("$'label: for $i in $start ..= $end { $body; }")
-            range_step_excl = mcx:parse_stmts("$'label: for $i in ($start .. $end).step_by($step) { $body; }")
-            range_step_incl = mcx:parse_stmts("$'label: for $i in ($start ..= $end).step_by($step) { $body; }")
+            local range_one_excl = mcx:parse_stmts("$'label: for $i in $start .. $end { $body; }")
+            local range_one_incl = mcx:parse_stmts("$'label: for $i in $start ..= $end { $body; }")
+            local range_step_excl = mcx:parse_stmts("$'label: for $i in ($start .. $end).step_by($step as usize) { $body; }")
+            local range_step_incl = mcx:parse_stmts("$'label: for $i in ($start ..= $end).step_by($step as usize) { $body; }")
+
+            local assign_ops = {"=", "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=", "<<=", ">>="}
+            local assign_stmts = tablex.map(
+               function(op)
+                  return mcx:parse_expr("$i " .. op .. " $e:Expr")
+               end,
+               assign_ops
+            )
 
             mcx:fold_with(
                pat,
@@ -31,10 +41,8 @@ $'label:?Ident: while $cond:Expr {
                      return orig
                   end
 
-                  print("parsed cond")
-
                   incr = mcx:get_stmt("$incr")
-                  incr_kind = incr:get_kind()
+                  incr_kind = incr:kind_name()
                   if (incr_kind == "Semi" or
                       incr_kind == "Expr") then
                      incr = incr:get_node()
@@ -47,10 +55,15 @@ $'label:?Ident: while $cond:Expr {
                      return orig
                   end
 
-                  print("parsed incr")
+                  body = mcx:get_multistmt("$body")
+                  for _,stmt in ipairs(assign_stmts) do
+                     if mcx:find_first(stmt, body) then
+                        return orig
+                     end
+                  end
 
                   step = mcx:get_expr("$step")
-                  if (step:get_kind() == "Lit" and
+                  if (step:kind_name() == "Lit" and
                       step:get_node():get_value() == 1) then
                      if range_excl then
                         repl_step = range_one_excl
@@ -65,7 +78,6 @@ $'label:?Ident: while $cond:Expr {
                      end
                   end
 
-                  print("substituting")
                   return mcx:subst(repl_step)
                end
             )
@@ -73,4 +85,4 @@ $'label:?Ident: while $cond:Expr {
       )
    end
 )
-print("finished")
+refactor:save_crate()

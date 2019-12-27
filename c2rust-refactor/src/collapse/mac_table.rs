@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use rustc_target::spec::abi::Abi;
 use syntax::ast::*;
-use syntax::parse::token::{DelimToken, Nonterminal, Token};
-use syntax::parse::token::{Lit as TokenLit, LitKind as TokenLitKind};
+use syntax::token::{BinOpToken, DelimToken, Nonterminal, Token, TokenKind};
+use syntax::token::{Lit as TokenLit, LitKind as TokenLitKind};
 use syntax::source_map::{Span, SyntaxContext};
 use syntax::tokenstream::{DelimSpan, TokenStream, TokenTree};
 use syntax::ThinVec;
@@ -323,6 +323,11 @@ where
                     cx.record_macro_with_id(child_invoc_id, new.as_mac_node_ref());
                 } else {
                     cx.record_macro_with_id(invoc_id, new.as_mac_node_ref());
+
+                    // Recurse into children so they get added to the node map.
+                    if let InvocKind::ItemAttr(_) = invoc {
+                        CollectMacros::collect_macros(old, new, cx);
+                    }
                 }
                 cx.record_node_id_match(old.get_node_id(), new.get_node_id());
                 j += 1;
@@ -334,12 +339,10 @@ where
             while j < new_seq.len() && is_macro_generated(new_seq[j].get_span()) {
                 j += 1;
             }
-            assert!(
-                j < new_seq.len(),
-                "impossible: ran out of items in expanded sequence"
-            );
-            CollectMacros::collect_macros(old, &new_seq[j], cx);
-            j += 1;
+            if j < new_seq.len() {
+                CollectMacros::collect_macros(old, &new_seq[j], cx);
+                j += 1;
+            }
         }
     }
 
@@ -453,7 +456,7 @@ trait MaybeInvoc {
 
 impl MaybeInvoc for Expr {
     fn as_invoc(&self) -> Option<InvocKind> {
-        match self.node {
+        match self.kind {
             ExprKind::Mac(ref mac) => Some(InvocKind::Mac(mac)),
             _ => None,
         }
@@ -462,7 +465,7 @@ impl MaybeInvoc for Expr {
 
 impl MaybeInvoc for Pat {
     fn as_invoc(&self) -> Option<InvocKind> {
-        match self.node {
+        match self.kind {
             PatKind::Mac(ref mac) => Some(InvocKind::Mac(mac)),
             _ => None,
         }
@@ -471,7 +474,7 @@ impl MaybeInvoc for Pat {
 
 impl MaybeInvoc for Ty {
     fn as_invoc(&self) -> Option<InvocKind> {
-        match self.node {
+        match self.kind {
             TyKind::Mac(ref mac) => Some(InvocKind::Mac(mac)),
             _ => None,
         }
@@ -480,7 +483,7 @@ impl MaybeInvoc for Ty {
 
 impl MaybeInvoc for Item {
     fn as_invoc(&self) -> Option<InvocKind> {
-        match self.node {
+        match self.kind {
             ItemKind::Mac(ref mac) => Some(InvocKind::Mac(mac)),
             _ => {
                 if attr::contains_name(&self.attrs, Symbol::intern("derive"))
@@ -498,7 +501,7 @@ impl MaybeInvoc for Item {
 
 impl MaybeInvoc for ImplItem {
     fn as_invoc(&self) -> Option<InvocKind> {
-        match self.node {
+        match self.kind {
             ImplItemKind::Macro(ref mac) => Some(InvocKind::Mac(mac)),
             _ => None,
         }
@@ -507,7 +510,7 @@ impl MaybeInvoc for ImplItem {
 
 impl MaybeInvoc for TraitItem {
     fn as_invoc(&self) -> Option<InvocKind> {
-        match self.node {
+        match self.kind {
             TraitItemKind::Macro(ref mac) => Some(InvocKind::Mac(mac)),
             _ => None,
         }
@@ -516,7 +519,7 @@ impl MaybeInvoc for TraitItem {
 
 impl MaybeInvoc for ForeignItem {
     fn as_invoc(&self) -> Option<InvocKind> {
-        match self.node {
+        match self.kind {
             ForeignItemKind::Macro(ref mac) => Some(InvocKind::Mac(mac)),
             _ => None,
         }
@@ -525,7 +528,7 @@ impl MaybeInvoc for ForeignItem {
 
 impl MaybeInvoc for Stmt {
     fn as_invoc(&self) -> Option<InvocKind> {
-        match self.node {
+        match self.kind {
             StmtKind::Mac(ref mac) => Some(InvocKind::Mac(&mac.0)),
             _ => None,
         }

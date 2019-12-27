@@ -6,9 +6,9 @@
 [azure]: https://dev.azure.com/immunant/c2rust/_build/latest?definitionId=1&branchName=master
 [Latest Version]: https://img.shields.io/crates/v/c2rust.svg
 [crates.io]: https://crates.io/crates/c2rust
-[Rustc Version]: https://img.shields.io/badge/rustc-nightly--2019--06--22-lightgrey.svg "Rustc nightly-2019-06-22"
+[Rustc Version]: https://img.shields.io/badge/rustc-nightly--2019--12--05-lightgrey.svg "Rustc nightly-2019-12-05"
 
-C2Rust helps you migrate C99-compliant code to Rust. The [translator](c2rust-transpile) (or transpiler) produces unsafe code Rust code that closely mirrors the input C code. The primary goal of the translator is to preserve functionality; test suites should continue to pass after translation. Generating safe and idiomatic Rust code from C ultimately requires manual effort. However, we are building a scriptable [refactoring tool](c2rust-refactor) that reduces the tedium of doing so. You can also [cross-check](cross-checks) the translated code against the original ([tutorial](docs/cross-check-tutorial.md)).
+C2Rust helps you migrate C99-compliant code to Rust. The [translator](c2rust-transpile) (or transpiler) produces unsafe Rust code that closely mirrors the input C code. The primary goal of the translator is to preserve functionality; test suites should continue to pass after translation. Generating safe and idiomatic Rust code from C ultimately requires manual effort. However, we are building a scriptable [refactoring tool](c2rust-refactor) that reduces the tedium of doing so. You can also [cross-check](cross-checks) the translated code against the original ([tutorial](docs/cross-check-tutorial.md)).
 
 Here's the big picture:
 
@@ -28,11 +28,11 @@ C2Rust requires LLVM 6, 7, or 8 with its corresponding clang compiler and librar
 
 - **Ubuntu 16.04, 18.04 & 18.10:**
 
-        apt install build-essential llvm-6.0 clang-6.0 libclang-6.0-dev cmake libssl-dev pkg-config
+        apt install build-essential llvm-6.0 clang-6.0 libclang-6.0-dev cmake libssl-dev pkg-config python3
 
 - **Arch Linux:**
 
-        pacman -S base-devel llvm clang cmake openssl
+        pacman -S base-devel llvm clang cmake openssl python
         
 - **NixOS / nix:**
 
@@ -44,29 +44,30 @@ C2Rust requires LLVM 6, 7, or 8 with its corresponding clang compiler and librar
         brew install llvm python3 cmake openssl
 
 
-Finally, a rust installation with [Rustup](https://rustup.rs/) is required on all platforms. You will also need to install `rustfmt`:
+Finally, installing the correct nightly Rust compiler with [Rustup](https://rustup.rs/) is required on all platforms. You will also need to add `rustfmt`:
 
-    rustup component add rustfmt
+    rustup install nightly-2019-12-05
+    rustup component add --toolchain nightly-2019-12-05 rustfmt
 
 
 ### Installing from crates.io
 
-    cargo +nightly-2019-06-22 install c2rust
+    cargo +nightly-2019-12-05 install c2rust
 
 On OS X with Homebrew LLVM, you need to point the build system at the LLVM installation as follows:
 
-    LLVM_CONFIG_PATH=/usr/local/opt/llvm/bin/llvm-config cargo +nightly-2019-06-22 install c2rust
+    LLVM_CONFIG_PATH=/usr/local/opt/llvm/bin/llvm-config cargo +nightly-2019-12-05 install c2rust
 
 On Linux with Linuxbrew LLVM, you need to point the build system at the LLVM installation as follows:
 
-    LLVM_CONFIG_PATH=/home/linuxbrew/.linuxbrew/opt/llvm/bin/llvm-config cargo +nightly-2019-06-22 install c2rust    
+    LLVM_CONFIG_PATH=/home/linuxbrew/.linuxbrew/opt/llvm/bin/llvm-config cargo +nightly-2019-12-05 install c2rust    
 
 Note: adjust `LLVM_CONFIG_PATH` accordingly if Linuxbrew was installed to your home directory.
 
 On Gentoo, you need to point the build system to the location of `libclang.so` 
   and `llvm-config` as follows:
 
-    LLVM_CONFIG_PATH=/path/to/llvm-config LIBCLANG_PATH=/path/to/libclang.so cargo +nightly-2019-06-22 install c2rust 
+    LLVM_CONFIG_PATH=/path/to/llvm-config LIBCLANG_PATH=/path/to/libclang.so cargo +nightly-2019-12-05 install c2rust 
 
 
 If you have trouble with building and installing, or want to build from the latest master, the [developer docs](docs/README-developers.md#building-with-system-llvm-libraries) provide more details on the build system.
@@ -76,7 +77,7 @@ If you have trouble with building and installing, or want to build from the late
 If you'd like to check our recently developed features or you urgently require a bugfixed version of c2rust
 you can install it directly from Git:
 
-    cargo +nightly-2019-06-22 install --git https://github.com/immunant/c2rust.git c2rust
+    cargo +nightly-2019-12-05 install --git https://github.com/immunant/c2rust.git c2rust
    
 Please note that the master branch is under constant development and you may expirience issues or crashes.
 
@@ -90,7 +91,7 @@ To translate C files specified in `compile_commands.json` (see below), run the `
 
 (The `c2rust refactor` tool is also available for refactoring Rust code, see [refactoring](c2rust-refactor/)).
 
-The translator requires the exact compiler commands used to build the C code. To provide this information, you will need a [standard](https://clang.llvm.org/docs/JSONCompilationDatabase.html) `compile_commands.json` file. Many build systems can automatically generate this file, as it is used by many other tools, but see [below](#generating-compile_commandsjson-files) for recommendations on how to generate this file for common build processes.
+The translator requires the exact compiler commands used to build the C code. This information is provided via a compilation database file named `compile_commands.json`. (Read more about compilation databases [here](https://clang.llvm.org/docs/JSONCompilationDatabase.html) and [here](https://sarcasm.github.io/notes/dev/compilation-database.html)). Many build systems can automatically generate this file; we show a few examples [below](#generating-compile_commandsjson-files).
 
 Once you have a `compile_commands.json` file describing the C build, translate the C code to Rust with the following command:
 
@@ -102,9 +103,9 @@ To generate a `Cargo.toml` template for a Rust library, add the `-e` option:
 
 To generate a `Cargo.toml` template for a Rust binary, do this:
 
-    c2rust transpile --main myprog path/to/compile_commands.json
+    c2rust transpile --binary myprog path/to/compile_commands.json
 
-Where `--main myprog` tells the transpiler to use the `main` method from `myprog.rs` as the entry point.
+Where `--binary myprog` tells the transpiler to use the `main` method from `myprog.rs` as the entry point for a binary.
 
 The translated Rust files will not depend directly on each other like
 normal Rust modules. They will export and import functions through the C

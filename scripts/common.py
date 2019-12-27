@@ -65,6 +65,7 @@ class Config:
     XCHECK_BACKEND_DYNAMIC_DLSYM_CRATE_DIR = os.path.join(RUST_CHECKS_DIR, 'backends', 'dynamic-dlsym')
     XCHECK_CONFIG_CRATE_DIR = os.path.join(RUST_CHECKS_DIR, 'config')
     MACROS_CRATE_DIR = os.path.join(ROOT_DIR, 'c2rust-macros')
+    AST_PRINTER_CRATE_DIR = os.path.join(ROOT_DIR, 'c2rust-ast-printer')
 
     CBOR_PREFIX = os.path.join(BUILD_DIR, "tinycbor")
 
@@ -75,6 +76,7 @@ class Config:
     LLVM_ARCHIVE_URLS = [
         'http://releases.llvm.org/{ver}/llvm-{ver}.src.tar.xz',
         'http://releases.llvm.org/{ver}/cfe-{ver}.src.tar.xz',
+        'http://releases.llvm.org/{ver}/compiler-rt-{ver}.src.tar.xz',
         'http://releases.llvm.org/{ver}/clang-tools-extra-{ver}.src.tar.xz',
     ]
     # See http://releases.llvm.org/download.html#7.0.0
@@ -96,7 +98,7 @@ class Config:
     MIN_PLUMBUM_VERSION = (1, 6, 3)
     CC_DB_JSON = "compile_commands.json"
 
-    CUSTOM_RUST_NAME = 'nightly-2019-06-22'
+    CUSTOM_RUST_NAME = 'nightly-2019-12-05'
 
     """
     Reflect changes to all configuration variables that depend on LLVM_VER
@@ -504,7 +506,7 @@ def transpile(cc_db_path: str,
     if emit_modules:
         args.append('--emit-modules')
     if main_module_for_build_files:
-        args.append('--main')
+        args.append('--binary')
         args.append(main_module_for_build_files)
     if cross_checks:
         args.append('--cross-checks')

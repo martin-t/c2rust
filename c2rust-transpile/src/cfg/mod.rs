@@ -30,7 +30,7 @@ use syntax;
 use syntax::ast::{Arm, Expr, ExprKind, Lit, LitIntType, LitKind, Pat, Stmt, StmtKind};
 use syntax::print::pprust;
 use syntax::ptr::P;
-use syntax_pos::DUMMY_SP;
+use syntax_pos::{DUMMY_SP, Span};
 
 use indexmap::{IndexMap, IndexSet};
 
@@ -83,11 +83,11 @@ impl Label {
         self.hash(&mut s);
         let as_num = s.finish();
 
-        mk().lit_expr(mk().int_lit(as_num as u128, ""))
+        mk().lit_expr(as_num as u128)
     }
 
     fn to_string_expr(&self) -> P<Expr> {
-        mk().lit_expr(mk().str_lit(self.debug_print()))
+        mk().lit_expr(self.debug_print())
     }
 }
 
@@ -113,7 +113,7 @@ impl StructureLabel<StmtOrDecl> {
         self,
         lift_me: &IndexSet<CDeclId>,
         store: &mut DeclStmtStore,
-    ) -> StructureLabel<StmtOrComment> {
+    ) -> StructureLabel<Stmt> {
         match self {
             StructureLabel::GoTo(l) => StructureLabel::GoTo(l),
             StructureLabel::ExitTo(l) => StructureLabel::ExitTo(l),
@@ -135,6 +135,7 @@ pub enum Structure<Stmt> {
     Simple {
         entries: IndexSet<Label>,
         body: Vec<Stmt>,
+        span: Span,
         terminator: GenTerminator<StructureLabel<Stmt>>,
     },
     /// Looping constructs
@@ -167,16 +168,17 @@ impl Structure<StmtOrDecl> {
         self,
         lift_me: &IndexSet<CDeclId>,
         store: &mut DeclStmtStore,
-    ) -> Structure<StmtOrComment> {
+    ) -> Structure<Stmt> {
         match self {
             Structure::Simple {
                 entries,
                 body,
+                span,
                 terminator,
             } => {
                 let body = body
                     .into_iter()
-                    .flat_map(|s: StmtOrDecl| -> Vec<StmtOrComment> {
+                    .flat_map(|s: StmtOrDecl| -> Vec<Stmt> {
                         s.place_decls(lift_me, store)
                     })
                     .collect();
@@ -184,6 +186,7 @@ impl Structure<StmtOrDecl> {
                 Structure::Simple {
                     entries,
                     body,
+                    span,
                     terminator,
                 }
             }
@@ -238,6 +241,9 @@ pub struct BasicBlock<L, S> {
 
     /// Variables defined in this block
     defined: IndexSet<CDeclId>,
+
+    /// Span of this block
+    span: Span,
 }
 
 impl<L: Clone, S1> BasicBlock<L, S1> {
@@ -249,6 +255,7 @@ impl<L: Clone, S1> BasicBlock<L, S1> {
             terminator: self.terminator.clone(),
             live: self.live.clone(),
             defined: self.defined.clone(),
+            span: self.span,
         }
     }
 }
@@ -269,6 +276,7 @@ impl<L, S> BasicBlock<L, S> {
             terminator,
             live: IndexSet::new(),
             defined: IndexSet::new(),
+            span: DUMMY_SP,
         }
     }
 
@@ -307,7 +315,7 @@ pub enum GenTerminator<Lbl> {
     /// Multi-way branch. The patterns are expected to match the type of the expression.
     Switch {
         expr: P<Expr>,
-        cases: Vec<(Vec<P<Pat>>, Lbl)>, // TODO: support ranges of expressions
+        cases: Vec<(P<Pat>, Lbl)>, // TODO: support ranges of expressions
     },
 }
 
@@ -332,9 +340,9 @@ impl<L: Serialize> Serialize for GenTerminator<L> {
                 ref cases,
             } => {
                 let mut cases_sane: Vec<(String, &L)> = vec![];
-                for &(ref ps, ref l) in cases {
-                    let pats: Vec<String> = ps.iter().map(|x| pprust::pat_to_string(x)).collect();
-                    cases_sane.push((pats.join(" | "), l));
+                for &(ref p, ref l) in cases {
+                    let pat: String = pprust::pat_to_string(p);
+                    cases_sane.push((pat, l));
                 }
 
                 let mut tv = serializer.serialize_struct_variant("Terminator", 3, "Switch", 2)?;
@@ -399,7 +407,7 @@ impl GenTerminator<StructureLabel<StmtOrDecl>> {
         self,
         lift_me: &IndexSet<CDeclId>,
         store: &mut DeclStmtStore,
-    ) -> GenTerminator<StructureLabel<StmtOrComment>> {
+    ) -> GenTerminator<StructureLabel<Stmt>> {
         match self {
             End => End,
             Jump(l) => {
@@ -438,9 +446,6 @@ pub enum StmtOrDecl {
 
     /// C declaration
     Decl(CDeclId),
-
-    /// Comment
-    Comment(String),
 }
 
 impl StmtOrDecl {
@@ -451,19 +456,8 @@ impl StmtOrDecl {
                 let ss = store.peek_decl_and_assign(*d).unwrap();
                 ss.iter().map(pprust::stmt_to_string).collect()
             }
-            StmtOrDecl::Comment(ref s) => vec![s.clone()],
         }
     }
-}
-
-/// A Rust statement, or a comment
-#[derive(Clone, Debug)]
-pub enum StmtOrComment {
-    /// Rust statement
-    Stmt(Stmt),
-
-    /// Comment
-    Comment(String),
 }
 
 impl StmtOrDecl {
@@ -473,21 +467,18 @@ impl StmtOrDecl {
         self,
         lift_me: &IndexSet<CDeclId>,
         store: &mut DeclStmtStore,
-    ) -> Vec<StmtOrComment> {
+    ) -> Vec<Stmt> {
         match self {
-            StmtOrDecl::Stmt(s) => vec![StmtOrComment::Stmt(s)],
-            StmtOrDecl::Comment(c) => vec![StmtOrComment::Comment(c)],
+            StmtOrDecl::Stmt(s) => vec![s],
             StmtOrDecl::Decl(d) if lift_me.contains(&d) => store
                 .extract_assign(d)
                 .unwrap()
                 .into_iter()
-                .map(StmtOrComment::Stmt)
                 .collect(),
             StmtOrDecl::Decl(d) => store
                 .extract_decl_and_assign(d)
                 .unwrap()
                 .into_iter()
-                .map(StmtOrComment::Stmt)
                 .collect(),
         }
     }
@@ -722,12 +713,12 @@ impl<Lbl: Copy + Ord + Hash + Debug, Stmt> Cfg<Lbl, Stmt> {
         let mut actual_rewrites: IndexMap<Lbl, Lbl> = IndexMap::new();
 
         while let Some((from, to)) = proposed_rewrites.iter().map(|(f, t)| (*f, *t)).next() {
-            proposed_rewrites.remove(&from);
+            proposed_rewrites.swap_remove(&from);
             let mut from_any: IndexSet<Lbl> = indexset![from];
 
             // Try to apply more rewrites from `proposed_rewrites`
             let mut to_intermediate: Lbl = to;
-            while let Some(to_new) = proposed_rewrites.remove(&to_intermediate) {
+            while let Some(to_new) = proposed_rewrites.swap_remove(&to_intermediate) {
                 from_any.insert(to_intermediate);
                 to_intermediate = to_new;
             }
@@ -744,6 +735,15 @@ impl<Lbl: Copy + Ord + Hash + Debug, Stmt> Cfg<Lbl, Stmt> {
             // It makes no sense to remap something to itself
             for from in from_any {
                 if from != to_final {
+                    let span = self.nodes[&from].span;
+                    let tgt_span = &mut self.nodes[&to_final].span;
+                    if tgt_span.is_dummy() {
+                        *tgt_span = span;
+                    } else if !span.is_dummy() {
+                        // If we can't transfer this basic block's span to the
+                        // target, don't delete it
+                        continue;
+                    }
                     actual_rewrites.insert(from, to_final);
                 }
             }
@@ -1016,7 +1016,7 @@ impl DeclStmtStore {
     /// Extract _just_ the Rust statements for a declaration (without initialization). Used when you
     /// want to move just a declaration to a larger scope.
     pub fn extract_decl(&mut self, decl_id: CDeclId) -> Result<Vec<Stmt>, TranslationError> {
-        let DeclStmtInfo { decl, assign, .. } = self.store.remove(&decl_id).ok_or(format_err!(
+        let DeclStmtInfo { decl, assign, .. } = self.store.swap_remove(&decl_id).ok_or(format_err!(
             "Cannot find information on declaration 1 {:?}",
             decl_id
         ))?;
@@ -1040,7 +1040,7 @@ impl DeclStmtStore {
     /// initially attached to). Used when you've moved a declaration but now you need to also run the
     /// initializer.
     pub fn extract_assign(&mut self, decl_id: CDeclId) -> Result<Vec<Stmt>, TranslationError> {
-        let DeclStmtInfo { decl, assign, .. } = self.store.remove(&decl_id).ok_or(format_err!(
+        let DeclStmtInfo { decl, assign, .. } = self.store.swap_remove(&decl_id).ok_or(format_err!(
             "Cannot find information on declaration 2 {:?}",
             decl_id
         ))?;
@@ -1068,7 +1068,7 @@ impl DeclStmtStore {
     ) -> Result<Vec<Stmt>, TranslationError> {
         let DeclStmtInfo {
             decl_and_assign, ..
-        } = self.store.remove(&decl_id).ok_or(format_err!(
+        } = self.store.swap_remove(&decl_id).ok_or(format_err!(
             "Cannot find information on declaration 3 {:?}",
             decl_id
         ))?;
@@ -1123,6 +1123,9 @@ struct WipBlock {
 
     /// Variables live in this WIP.
     live: IndexSet<CDeclId>,
+
+    /// Span of this block
+    span: Span,
 }
 
 impl Extend<Stmt> for WipBlock {
@@ -1140,10 +1143,6 @@ impl WipBlock {
 
     pub fn push_decl(&mut self, decl: CDeclId) {
         self.body.push(StmtOrDecl::Decl(decl))
-    }
-
-    pub fn push_comment(&mut self, cmmt: String) {
-        self.body.push(StmtOrDecl::Comment(cmmt))
     }
 }
 
@@ -1193,6 +1192,7 @@ impl CfgBuilder {
             body,
             defined,
             live,
+            span,
         } = wip;
         self.add_block(
             label,
@@ -1201,6 +1201,7 @@ impl CfgBuilder {
                 terminator,
                 defined,
                 live,
+                span,
             },
         );
     }
@@ -1289,6 +1290,7 @@ impl CfgBuilder {
             body: vec![],
             defined: IndexSet::new(),
             live: self.current_variables(),
+            span: DUMMY_SP,
         }
     }
 
@@ -1385,12 +1387,7 @@ impl CfgBuilder {
 
         let mut wip = self.new_wip_block(entry);
 
-        // Add statement comment into current block right before the current statement
-        if let Some(comments) = translator.comment_context.get_stmt_comment(stmt_id) {
-            for cmmt in comments {
-                wip.push_comment(cmmt.clone());
-            }
-        }
+        wip.span = translator.get_span(SomeId::Stmt(stmt_id)).unwrap_or(DUMMY_SP);
 
         let out_wip: Result<Option<WipBlock>, TranslationError> =
             match translator.ast_context.index(stmt_id).kind {
@@ -1403,16 +1400,6 @@ impl CfgBuilder {
                             .decls_seen
                             .store
                             .insert(*decl, info);
-
-                        // Add declaration comment into current block right before the declaration
-                        if let Some(comments) = translator
-                            .comment_context
-                            .get_decl_comment(*decl)
-                        {
-                            for cmmt in comments {
-                                wip.push_comment(cmmt.clone());
-                            }
-                        }
 
                         wip.push_decl(*decl);
                         wip.defined.insert(*decl);
@@ -1451,6 +1438,7 @@ impl CfgBuilder {
                     // Condition
                     let (stmts, val) = translator.convert_condition(ctx, true, scrutinee)?.discard_unsafe();
                     wip.extend(stmts);
+
                     let cond_val = translator.ast_context[scrutinee].kind.get_bool();
                     self.add_wip_block(
                         wip,
@@ -1507,6 +1495,7 @@ impl CfgBuilder {
                     let cond_val = translator.ast_context[condition].kind.get_bool();
                     let mut cond_wip = self.new_wip_block(cond_entry);
                     cond_wip.extend(stmts);
+
                     self.add_wip_block(
                         cond_wip,
                         match cond_val {
@@ -1858,13 +1847,9 @@ impl CfgBuilder {
                         .pop()
                         .expect("No 'SwitchCases' to pop");
 
-                    let mut cases: Vec<_> = switch_case
-                        .cases
-                        .into_iter()
-                        .map(|(p, lbl)| (vec![p], lbl))
-                        .collect();
+                    let mut cases: Vec<_> = switch_case.cases.clone();
                     cases.push((
-                        vec![mk().wild_pat()],
+                        mk().wild_pat(),
                         switch_case.default.unwrap_or(next_label),
                     ));
 
@@ -2000,6 +1985,8 @@ impl CfgBuilder {
             false,
         )?;
 
+        let inner_span = stmts.first().map(|stmt| stmt.span);
+
         // Remove unnecessary break statements. We only need a break statement if we failed to
         // remove the tail expr.
         let need_block =
@@ -2013,6 +2000,17 @@ impl CfgBuilder {
         }
 
         let mut flattened_wip = self.new_wip_block(entry);
+        // Copy span from removed statement if there was only one.
+        if stmts.is_empty() {
+            if let Some(span) = inner_span {
+                // We move any comments on the high end of the span to the low,
+                // because those comments should go before the next node, not after.
+                flattened_wip.span = translator
+                    .comment_store
+                    .borrow_mut()
+                    .move_comments_to_begin(span);
+            }
+        }
         flattened_wip.extend(stmts);
         let term = if let Some(l) = next_lbl {
             GenTerminator::Jump(l)
@@ -2170,13 +2168,10 @@ impl Cfg<Label, StmtOrDecl> {
                 Switch { ref cases, .. } => {
                     let cases: Vec<(String, Label)> = cases
                         .iter()
-                        .map(|&(ref pats, tgt)| -> (String, Label) {
-                            let pats: Vec<String> = pats
-                                .iter()
-                                .map(|p| pprust::pat_to_string(p.deref()))
-                                .collect();
+                        .map(|&(ref pat, tgt)| -> (String, Label) {
+                            let pat: String = pprust::pat_to_string(pat.deref());
 
-                            (pats.join(" | "), tgt)
+                            (pat, tgt)
                         })
                         .collect();
                     cases

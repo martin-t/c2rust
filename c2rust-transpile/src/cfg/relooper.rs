@@ -11,7 +11,7 @@ pub fn reloop(
     use_c_loop_info: bool,       // use the loop information in the CFG (slower, but better)
     use_c_multiple_info: bool,   // use the multiple information in the CFG (slower, but better)
     live_in: IndexSet<CDeclId>,  // declarations we assume are live going into this graph
-) -> (Vec<Stmt>, Vec<Structure<StmtOrComment>>) {
+) -> (Vec<Stmt>, Vec<Structure<Stmt>>) {
     let entries: IndexSet<Label> = vec![cfg.entries].into_iter().collect();
     let blocks = cfg
         .nodes
@@ -25,6 +25,7 @@ pub fn reloop(
                     terminator,
                     defined: bb.defined,
                     live: bb.live,
+                    span: bb.span,
                 },
             )
         })
@@ -54,7 +55,7 @@ pub fn reloop(
         .collect();
 
     // We map over the existing structure and flatten everything to `Stmt`
-    let mut relooped: Vec<Structure<StmtOrComment>> = relooped_with_decls
+    let mut relooped: Vec<Structure<Stmt>> = relooped_with_decls
         .into_iter()
         .map(|s| s.place_decls(&lift_me, &mut store))
         .collect();
@@ -187,13 +188,14 @@ impl RelooperState {
                 .next()
                 .expect("Should find exactly one entry");
 
-            if let Some(bb) = blocks.remove(&entry) {
+            if let Some(bb) = blocks.swap_remove(&entry) {
                 let new_entries = bb.successors();
                 let BasicBlock {
                     body,
                     terminator,
                     live,
                     defined,
+                    span,
                 } = bb;
 
                 // Flag declarations for everything that is live going in but not already in scope.
@@ -216,6 +218,7 @@ impl RelooperState {
                 result.push(Structure::Simple {
                     entries,
                     body,
+                    span,
                     terminator,
                 });
 
@@ -227,6 +230,7 @@ impl RelooperState {
                 result.push(Structure::Simple {
                     entries,
                     body,
+                    span: DUMMY_SP,
                     terminator,
                 });
             };
@@ -329,7 +333,7 @@ impl RelooperState {
                     }
 
                     // Check we've actually visited all of the expected content
-                    visited.remove(&join);
+                    visited.swap_remove(&join);
                     if let Some(_) = visited.difference(content).next() {
                         recognized_c_multiple = false;
                     }
@@ -487,7 +491,7 @@ impl RelooperState {
         let handler_keys: IndexSet<Label> = all_handlers.keys().cloned().collect();
         let (then, branches) = if handler_keys == entries {
             let a_key = *all_handlers.keys().next().expect("no handlers found");
-            let last_handler = all_handlers.remove(&a_key).expect("just got this key");
+            let last_handler = all_handlers.swap_remove(&a_key).expect("just got this key");
             (last_handler, all_handlers)
         } else {
             (vec![], all_handlers)
@@ -544,6 +548,7 @@ fn simplify_structure<Stmt: Clone>(structures: Vec<Structure<Stmt>>) -> Vec<Stru
             &Structure::Simple {
                 ref entries,
                 ref body,
+                ref span,
                 ref terminator,
             } => {
                 // Here, we ensure that all labels in a terminator are mentioned only once in the
@@ -557,16 +562,16 @@ fn simplify_structure<Stmt: Clone>(structures: Vec<Structure<Stmt>>) -> Vec<Stru
                     let mut merged_goto: IndexMap<Label, Vec<P<Pat>>> = IndexMap::new();
                     let mut merged_exit: IndexMap<Label, Vec<P<Pat>>> = IndexMap::new();
 
-                    for &(ref pats, ref lbl) in cases {
+                    for &(ref pat, ref lbl) in cases {
                         match lbl {
                             &StructureLabel::GoTo(lbl) => merged_goto
                                 .entry(lbl)
                                 .or_insert(vec![])
-                                .extend(pats.clone()),
+                                .push(pat.clone()),
                             &StructureLabel::ExitTo(lbl) => merged_exit
                                 .entry(lbl)
                                 .or_insert(vec![])
-                                .extend(pats.clone()),
+                                .push(pat.clone()),
                             _ => panic!("simplify_structure: Nested precondition violated"),
                         }
                     }
@@ -577,13 +582,19 @@ fn simplify_structure<Stmt: Clone>(structures: Vec<Structure<Stmt>>) -> Vec<Stru
                     let mut cases_new: Vec<_> = vec![];
                     for &(_, ref lbl) in cases.iter().rev() {
                         match lbl {
-                            &StructureLabel::GoTo(lbl) => match merged_goto.remove(&lbl) {
+                            &StructureLabel::GoTo(lbl) => match merged_goto.swap_remove(&lbl) {
                                 None => {}
-                                Some(pats) => cases_new.push((pats, StructureLabel::GoTo(lbl))),
+                                Some(pats) => {
+                                    let pat = if pats.len() == 1 { pats[0].clone() } else { mk().or_pat(pats) };
+                                    cases_new.push((pat, StructureLabel::GoTo(lbl)))
+                                }
                             },
-                            &StructureLabel::ExitTo(lbl) => match merged_exit.remove(&lbl) {
+                            &StructureLabel::ExitTo(lbl) => match merged_exit.swap_remove(&lbl) {
                                 None => {}
-                                Some(pats) => cases_new.push((pats, StructureLabel::ExitTo(lbl))),
+                                Some(pats) => {
+                                    let pat = if pats.len() == 1 { pats[0].clone() } else { mk().or_pat(pats) };
+                                    cases_new.push((pat, StructureLabel::ExitTo(lbl)))
+                                }
                             },
                             _ => panic!("simplify_structure: Nested precondition violated"),
                         };
@@ -612,6 +623,7 @@ fn simplify_structure<Stmt: Clone>(structures: Vec<Structure<Stmt>>) -> Vec<Stru
                                 let first_structure = Structure::Simple {
                                     entries,
                                     body,
+                                    span: DUMMY_SP,
                                     terminator,
                                 };
 
@@ -626,10 +638,12 @@ fn simplify_structure<Stmt: Clone>(structures: Vec<Structure<Stmt>>) -> Vec<Stru
 
                         let terminator = terminator.map_labels(rewrite);
                         let body = body.clone();
+                        let span = *span;
                         let entries = entries.clone();
                         acc_structures.push(Structure::Simple {
                             entries,
                             body,
+                            span,
                             terminator,
                         });
                     }
@@ -640,10 +654,12 @@ fn simplify_structure<Stmt: Clone>(structures: Vec<Structure<Stmt>>) -> Vec<Stru
 
                         let entries = entries.clone();
                         let body = body.clone();
+                        let span = *span;
                         let terminator = terminator.clone();
                         acc_structures.push(Structure::Simple {
                             entries,
                             body,
+                            span,
                             terminator,
                         });
                     }

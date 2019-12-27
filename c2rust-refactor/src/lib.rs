@@ -5,40 +5,40 @@
     box_patterns,
     generator_trait,
     vec_remove_item,
+    drain_filter,
+    label_break_value,
+    slice_patterns,
 )]
 #![cfg_attr(feature = "profile", feature(proc_macro_hygiene))]
 
+extern crate syntax;
+extern crate syntax_ext;
+extern crate syntax_pos;
+#[macro_use]
+extern crate smallvec;
 extern crate arena;
-extern crate cargo;
-extern crate clap;
-extern crate diff;
-extern crate ena;
-extern crate env_logger;
-extern crate indexmap;
-extern crate libc;
-#[macro_use]
-extern crate json;
-#[macro_use]
-extern crate log;
-extern crate regex;
 extern crate rustc;
 extern crate rustc_codegen_utils;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_errors;
 extern crate rustc_incremental;
+extern crate rustc_index;
 extern crate rustc_interface;
+extern crate rustc_lexer;
 extern crate rustc_lint;
 extern crate rustc_metadata;
+extern crate rustc_parse;
 extern crate rustc_privacy;
 extern crate rustc_resolve;
 extern crate rustc_target;
+extern crate rustc_typeck;
 #[macro_use]
-extern crate smallvec;
+extern crate json;
+#[macro_use]
+extern crate log;
+extern crate regex;
 extern crate c2rust_ast_builder;
-extern crate syntax;
-extern crate syntax_ext;
-extern crate syntax_pos;
 
 #[cfg(feature = "profile")]
 extern crate flame;
@@ -157,6 +157,12 @@ pub enum RustcArgSource {
     Cargo(CargoTarget),
 }
 
+#[derive(Clone, Debug)]
+struct RustcArgs {
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
+}
+
 pub struct Options {
     pub rewrite_modes: Vec<file_io::OutputMode>,
     pub commands: Vec<Command>,
@@ -215,11 +221,14 @@ fn get_rustc_executable(path: &Path) -> String {
 }
 
 #[cfg_attr(feature = "profile", flame)]
-fn get_rustc_arg_strings(src: RustcArgSource) -> Vec<Vec<String>> {
+fn get_rustc_arg_strings(src: RustcArgSource) -> Vec<RustcArgs> {
     match src {
         RustcArgSource::CmdLine(mut args) => {
-            let mut rustc_args = vec![get_rustc_executable(Path::new("rustc"))];
-            rustc_args.append(&mut args);
+            let mut rustc_args = RustcArgs {
+                args: vec![get_rustc_executable(Path::new("rustc"))],
+                cwd: None,
+            };
+            rustc_args.args.append(&mut args);
             vec![rustc_args]
         }
         RustcArgSource::Cargo(target) => get_rustc_cargo_args(target),
@@ -227,7 +236,7 @@ fn get_rustc_arg_strings(src: RustcArgSource) -> Vec<Vec<String>> {
 }
 
 #[cfg_attr(feature = "profile", flame)]
-fn get_rustc_cargo_args(target_type: CargoTarget) -> Vec<Vec<String>> {
+fn get_rustc_cargo_args(target_type: CargoTarget) -> Vec<RustcArgs> {
     use cargo::core::compiler::{CompileMode, Context, DefaultExecutor, Executor, Unit};
     use cargo::core::manifest::TargetKind;
     use cargo::core::{maybe_allow_nightly_features, PackageId, Target, Workspace, Verbosity};
@@ -254,7 +263,7 @@ fn get_rustc_cargo_args(target_type: CargoTarget) -> Vec<Vec<String>> {
         default: DefaultExecutor,
         target_pkg: PackageId,
         target_type: CargoTarget,
-        pkg_args: Mutex<Vec<Vec<String>>>,
+        pkg_args: Mutex<Vec<RustcArgs>>,
     }
 
     impl LoggingExecutor {
@@ -280,14 +289,16 @@ fn get_rustc_cargo_args(target_type: CargoTarget) -> Vec<Vec<String>> {
                 .map(|os| os.to_str().unwrap().to_owned())
                 .collect();
             let mut g = self.pkg_args.lock().unwrap();
-            g.push(args);
+
+            let cwd = cmd.get_cwd().map(Path::to_path_buf);
+            g.push(RustcArgs { args, cwd });
 
             true
         }
     }
 
     impl Executor for LoggingExecutor {
-        fn init(&self, cx: &Context, unit: &Unit) {
+        fn init<'a, 'cfg>(&self, cx: &Context<'a, 'cfg>, unit: &Unit<'a>) {
             self.default.init(cx, unit);
         }
 
@@ -297,29 +308,11 @@ fn get_rustc_cargo_args(target_type: CargoTarget) -> Vec<Vec<String>> {
             id: PackageId,
             target: &Target,
             mode: CompileMode,
+            _on_stdout_line: &mut dyn FnMut(&str) -> CargoResult<()>,
+            _on_stderr_line: &mut dyn FnMut(&str) -> CargoResult<()>,
         ) -> CargoResult<()> {
-            if self.maybe_record_cmd(&cmd, &id, target) {
-                Ok(())
-            } else {
-                self.default.exec(cmd, id, target, mode)
-            }
-        }
-
-        fn exec_json(
-            &self,
-            cmd: ProcessBuilder,
-            id: PackageId,
-            target: &Target,
-            mode: CompileMode,
-            handle_stdout: &mut dyn FnMut(&str) -> CargoResult<()>,
-            handle_stderr: &mut dyn FnMut(&str) -> CargoResult<()>,
-        ) -> CargoResult<()> {
-            if self.maybe_record_cmd(&cmd, &id, target) {
-                Ok(())
-            } else {
-                self.default
-                    .exec_json(cmd, id, target, mode, handle_stdout, handle_stderr)
-            }
+            self.maybe_record_cmd(&cmd, &id, target);
+            self.default.exec(cmd, id, target, mode, &mut |_| Ok(()), &mut |_| Ok(()))
         }
 
         fn force_rebuild(&self, unit: &Unit) -> bool {
@@ -332,7 +325,7 @@ fn get_rustc_cargo_args(target_type: CargoTarget) -> Vec<Vec<String>> {
 
     let exec = Arc::new(LoggingExecutor {
         default: DefaultExecutor,
-        target_pkg: ws.current().unwrap().package_id().clone(),
+        target_pkg: ws.current().unwrap().package_id(),
         target_type,
         pkg_args: Mutex::new(vec![]),
     });
@@ -343,8 +336,8 @@ fn get_rustc_cargo_args(target_type: CargoTarget) -> Vec<Vec<String>> {
     let mut arg_vec = exec.pkg_args.lock().unwrap().clone();
 
     for args in &mut arg_vec {
-        let rustc = config.rustc(Some(&ws)).unwrap();
-        args.insert(0, get_rustc_executable(&rustc.path));
+        let rustc = config.load_global_rustc(Some(&ws)).unwrap();
+        args.args.insert(0, get_rustc_executable(&rustc.path));
         info!("cargo-provided rustc args = {:?}", args);
     }
 
@@ -354,6 +347,7 @@ fn get_rustc_cargo_args(target_type: CargoTarget) -> Vec<Vec<String>> {
 #[cfg_attr(feature = "profile", flame)]
 pub fn lib_main(opts: Options) -> interface::Result<()> {
     env_logger::init();
+    rustc_driver::install_ice_hook();
     info!("Begin refactoring");
 
     // Make sure we compile with the toolchain version that the refactoring tool
@@ -362,7 +356,12 @@ pub fn lib_main(opts: Options) -> interface::Result<()> {
         env::set_var("RUSTUP_TOOLCHAIN", toolchain_ver);
     }
 
-    rustc_driver::report_ices_to_stderr_if_any(move || main_impl(opts)).and_then(|x| x)
+    // Shut the compiler up while refactoring
+    let mut rustflags = env::var_os("RUSTFLAGS").unwrap_or_default();
+    rustflags.push(" -Awarnings");
+    env::set_var("RUSTFLAGS", rustflags);
+
+    rustc_driver::catch_fatal_errors(move || main_impl(opts)).and_then(|x| x)
 }
 
 fn main_impl(opts: Options) -> interface::Result<()> {
@@ -377,50 +376,57 @@ fn main_impl(opts: Options) -> interface::Result<()> {
             marks.insert((NodeId::from_usize(m.id), label));
         }
 
+        if let Some(ref cwd) = rustc_args.cwd {
+            env::set_current_dir(cwd)
+                .expect("Error changing current directory");
+        }
+
         // TODO: interface::run_compiler() here and create a RefactorState with the
         // callback. RefactorState should know how to reset the compiler when needed
         // and can handle querying the compiler.
 
-        if opts.cursors.len() > 0 {
-            let config = driver::create_config(&rustc_args);
+        if !opts.cursors.is_empty() {
+            let config = driver::create_config(&rustc_args.args);
             driver::run_compiler(config, None, |compiler| {
-                let expanded_crate = compiler.expansion().unwrap().take().0;
-                for c in &opts.cursors {
-                    let kind_result = c.kind.clone().map_or(Ok(pick_node::NodeKind::Any), |s| {
-                        pick_node::NodeKind::from_str(&s)
-                    });
-                    let kind = match kind_result {
-                        Ok(k) => k,
-                        Err(_) => {
-                            info!("Bad cursor kind: {:?}", c.kind.as_ref().unwrap());
-                            continue;
-                        }
-                    };
+                compiler.enter(|queries| {
+                    let expanded_crate = queries.expansion().unwrap().take().0;
+                    for c in &opts.cursors {
+                        let kind_result = c.kind.clone().map_or(Ok(pick_node::NodeKind::Any), |s| {
+                            pick_node::NodeKind::from_str(&s)
+                        });
+                        let kind = match kind_result {
+                            Ok(k) => k,
+                            Err(_) => {
+                                info!("Bad cursor kind: {:?}", c.kind.as_ref().unwrap());
+                                continue;
+                            }
+                        };
 
-                    let id = match pick_node::pick_node_at_loc(
-                        &expanded_crate,
-                        compiler.session(),
-                        kind,
-                        &c.file,
-                        c.line,
-                        c.col,
-                    ) {
-                        Some(info) => info.id,
-                        None => {
-                            info!(
-                                "Failed to find {:?} at {}:{}:{}",
-                                kind, c.file, c.line, c.col
-                            );
-                            continue;
-                        }
-                    };
+                        let id = match pick_node::pick_node_at_loc(
+                            &expanded_crate,
+                            compiler.session(),
+                            kind,
+                            &c.file,
+                            c.line,
+                            c.col,
+                        ) {
+                            Some(info) => info.id,
+                            None => {
+                                info!(
+                                    "Failed to find {:?} at {}:{}:{}",
+                                    kind, c.file, c.line, c.col
+                                );
+                                continue;
+                            }
+                        };
 
-                    let label = c.label.as_ref().map_or("target", |s| s).into_symbol();
+                        let label = c.label.as_ref().map_or("target", |s| s).into_symbol();
 
-                    info!("label {:?} as {:?}", id, label);
+                        info!("label {:?} as {:?}", id, label);
 
-                    marks.insert((id, label));
-                }
+                        marks.insert((id, label));
+                    }
+                })
             });
         }
 
@@ -436,7 +442,7 @@ fn main_impl(opts: Options) -> interface::Result<()> {
 
         plugin::load_plugins(&opts.plugin_dirs, &opts.plugins, &mut cmd_reg);
 
-        let config = driver::create_config(&rustc_args);
+        let config = driver::create_config(&rustc_args.args);
 
         if opts.commands.len() == 1 && opts.commands[0].name == "interact" {
             interact::interact_command(&opts.commands[0].args, config, cmd_reg);
@@ -447,8 +453,7 @@ fn main_impl(opts: Options) -> interface::Result<()> {
                 config,
                 cmd_reg,
                 opts.rewrite_modes.clone(),
-            )
-                .expect("Error loading user script");
+            ).expect("Error loading user script");
         } else {
             let file_io = Arc::new(file_io::RealFileIO::new(opts.rewrite_modes.clone()));
             driver::run_refactoring(config, cmd_reg, file_io, marks, |mut state| {

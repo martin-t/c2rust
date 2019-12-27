@@ -1,10 +1,12 @@
 //! Intraprocedural step of the analysis.
 
+use log::Level;
 use rustc::hir::def_id::DefId;
 use rustc::mir::*;
 use rustc::ty::{Ty, TyKind};
-use rustc_data_structures::indexed_vec::IndexVec;
+use rustc_index::vec::IndexVec;
 use rustc_target::abi::VariantIdx;
+use syntax::source_map::{DUMMY_SP, Spanned};
 
 use crate::analysis::labeled_ty::{LabeledTy, LabeledTyCtxt};
 
@@ -58,7 +60,9 @@ pub struct IntraCtxt<'c, 'lty, 'a: 'lty, 'tcx: 'a> {
     stmt_idx: usize,
 
     cset: ConstraintSet<'lty>,
-    local_tys: IndexVec<Local, ITy<'lty, 'tcx>>,
+    /// A collection of local variable types. The pattern span will later
+    /// be used to map them in the marking phase
+    local_tys: IndexVec<Local, Spanned<ITy<'lty, 'tcx>>>,
     next_local_var: u32,
 
     /// List of function instantiation sites.
@@ -86,11 +90,11 @@ impl<'c, 'lty, 'a: 'lty, 'tcx: 'a> IntraCtxt<'c, 'lty, 'a, 'tcx> {
     ) -> IntraCtxt<'c, 'lty, 'a, 'tcx> {
         let ilcx = LabeledTyCtxt::new(cx.arena);
         IntraCtxt {
-            cx: cx,
-            ilcx: ilcx,
+            cx,
+            ilcx,
 
-            def_id: def_id,
-            mir: mir,
+            def_id,
+            mir,
             bbid: START_BLOCK,
             stmt_idx: !0,
 
@@ -120,11 +124,28 @@ impl<'c, 'lty, 'a: 'lty, 'tcx: 'a> IntraCtxt<'c, 'lty, 'a, 'tcx> {
             let lty = if l.index() == 0 {
                 sig.output
             } else if l.index() - 1 < self.mir.arg_count {
-                sig.inputs[l.index() - 1]
+                // Skip the variadic param
+                if l.index() == self.mir.arg_count && sig.is_variadic {
+                    self.ilcx.label(decl.ty, &mut |_| Label::None)
+                } else {
+                    sig.inputs[l.index() - 1]
+                }
             } else {
                 self.local_ty(decl.ty)
             };
-            self.local_tys.push(lty);
+
+            let span = match &decl.local_info {
+                LocalInfo::User(ClearCrossCrate::Set(binding)) => Some(binding),
+                _ => None,
+            }.map(|binding| match binding {
+                BindingForm::Var(var) => var.pat_span,
+                _ => DUMMY_SP,
+            }).unwrap_or(DUMMY_SP);
+
+            self.local_tys.push(Spanned {
+                node: lty,
+                span,
+            });
         }
 
         // Pick up any preset constraints for this variant.
@@ -146,13 +167,16 @@ impl<'c, 'lty, 'a: 'lty, 'tcx: 'a> IntraCtxt<'c, 'lty, 'a, 'tcx> {
         FnSig {
             inputs: self.ilcx.relabel_slice(sig.inputs, &mut f),
             output: self.ilcx.relabel(sig.output, &mut f),
+            is_variadic: sig.is_variadic,
         }
     }
 
     pub fn finish(mut self) {
-        eprintln!("  original constraints:");
-        for &(a, b) in self.cset.iter() {
-            eprintln!("    {:?} <= {:?}", a, b);
+        debug!("  original constraints:");
+        if log_enabled!(Level::Debug) {
+            for &(a, b) in self.cset.iter() {
+                debug!("    {:?} <= {:?}", a, b);
+            }
         }
 
         self.cset.remove_useless();
@@ -165,14 +189,38 @@ impl<'c, 'lty, 'a: 'lty, 'tcx: 'a> IntraCtxt<'c, 'lty, 'a, 'tcx> {
 
         self.cset.simplify(self.cx.arena);
 
-        eprintln!("  simplified constraints:");
-        for &(a, b) in self.cset.iter() {
-            eprintln!("    {:?} <= {:?}", a, b);
+        debug!("  simplified constraints:");
+        if log_enabled!(Level::Debug) {
+            for &(a, b) in self.cset.iter() {
+                debug!("    {:?} <= {:?}", a, b);
+            }
         }
 
-        let (_func, var) = self.cx.variant_summ(self.def_id);
+        // ITy -> LTy
+        let mut f = |&l: &Label<'lty>| match l {
+            Label::Ptr(p) => p.as_var().into_iter().find(|pv| match pv {
+                PermVar::Local(_) => true,
+                _ => false,
+            }),
+            _ => None,
+        };
+
+        let relabeled_locals = self.local_tys
+            .raw
+            .iter()
+            .filter_map(|spanned_ity| {
+                if spanned_ity.span == DUMMY_SP {
+                    None
+                } else {
+                    Some((spanned_ity.span, self.cx.lcx.relabel(spanned_ity.node, &mut f)))
+                }
+            })
+            .collect();
+
+        let (func, var) = self.cx.variant_summ(self.def_id);
         var.inst_cset = self.cset;
         var.insts = self.insts;
+        func.locals = relabeled_locals;
     }
 
     fn local_ty(&mut self, ty: Ty<'tcx>) -> ITy<'lty, 'tcx> {
@@ -184,7 +232,7 @@ impl<'c, 'lty, 'a: 'lty, 'tcx: 'a> IntraCtxt<'c, 'lty, 'a, 'tcx> {
             ref mut insts,
             ..
         } = *self;
-        ilcx.label(ty, &mut |ty| match ty.sty {
+        ilcx.label(ty, &mut |ty| match ty.kind {
             TyKind::Ref(_, _, _) | TyKind::RawPtr(_) => {
                 let v = Var(*next_local_var);
                 *next_local_var += 1;
@@ -211,7 +259,7 @@ impl<'c, 'lty, 'a: 'lty, 'tcx: 'a> IntraCtxt<'c, 'lty, 'a, 'tcx> {
     }
 
     fn local_var_ty(&mut self, l: Local) -> ITy<'lty, 'tcx> {
-        self.local_tys[l]
+        self.local_tys[l].node
     }
 
     fn static_ty(&mut self, def_id: DefId) -> ITy<'lty, 'tcx> {
@@ -230,56 +278,62 @@ impl<'c, 'lty, 'a: 'lty, 'tcx: 'a> IntraCtxt<'c, 'lty, 'a, 'tcx> {
         &mut self,
         lv: &Place<'tcx>,
     ) -> (ITy<'lty, 'tcx>, Perm<'lty>, Option<VariantIdx>) {
-        match lv {
-            Place::Base(PlaceBase::Local(l)) => (self.local_var_ty(*l), Perm::move_(), None),
+        if !lv.projection.is_empty() {
+            let mut projection = lv.projection.to_vec();
+            let last_elem = projection.pop().unwrap();
+            let parent = Place {
+                base: lv.base.clone(),
+                projection: self.cx.tcx.intern_place_elems(&projection),
+            };
+            let (base_ty, base_perm, base_variant) = self.place_lty_downcast(&parent);
 
-            Place::Base(PlaceBase::Static(ref s)) => match s.kind {
-                StaticKind::Static(def_id) => (self.static_ty(def_id), Perm::move_(), None),
-                StaticKind::Promoted(ref _p) => {
-                    // TODO: test this
-                    let pty = lv.ty(self.mir, self.cx.tcx);
-                    let ty = pty.ty;
-                    (self.local_ty(ty), Perm::read(), None)
-                }
-            },
+            // Sanity check
+            match last_elem {
+                ProjectionElem::Field(..) => {}
+                _ => assert!(base_variant.is_none(), "expected non-Downcast result"),
+            }
 
-            Place::Projection(box p) => {
-                let (base_ty, base_perm, base_variant) = self.place_lty_downcast(&p.base);
-
-                // Sanity check
-                match p.elem {
-                    ProjectionElem::Field(..) => {}
-                    _ => assert!(base_variant.is_none(), "expected non-Downcast result"),
-                }
-
-                match p.elem {
-                    // Access permissions for a deref are the minimum of all pointers along the
-                    // path to the value.
-                    ProjectionElem::Deref => (
-                        base_ty.args[0],
-                        self.cx.min_perm(base_perm, base_ty.label.perm()),
-                        None,
+            match last_elem {
+                // Access permissions for a deref are the minimum of all pointers along the
+                // path to the value.
+                ProjectionElem::Deref => (
+                    base_ty.args[0],
+                    self.cx.min_perm(base_perm, base_ty.label.perm()),
+                    None,
+                ),
+                ProjectionElem::Field(f, _) => (
+                    self.field_lty(
+                        base_ty,
+                        base_variant.unwrap_or(VariantIdx::from_usize(0)),
+                        f,
                     ),
-                    ProjectionElem::Field(f, _) => (
-                        self.field_lty(
-                            base_ty,
-                            base_variant.unwrap_or(VariantIdx::from_usize(0)),
-                            f,
-                        ),
-                        base_perm,
-                        None,
-                    ),
-                    ProjectionElem::Index(ref _index_op) => (base_ty.args[0], base_perm, None),
-                    ProjectionElem::ConstantIndex { .. } => unimplemented!(),
-                    ProjectionElem::Subslice { .. } => unimplemented!(),
-                    ProjectionElem::Downcast(_, variant) => (base_ty, base_perm, Some(variant)),
-                }
+                    base_perm,
+                    None,
+                ),
+                ProjectionElem::Index(ref _index_op) => (base_ty.args[0], base_perm, None),
+                ProjectionElem::ConstantIndex { .. } => unimplemented!(),
+                ProjectionElem::Subslice { .. } => unimplemented!(),
+                ProjectionElem::Downcast(_, variant) => (base_ty, base_perm, Some(variant)),
+            }
+        } else {
+            match lv.base {
+                PlaceBase::Local(l) => (self.local_var_ty(l), Perm::move_(), None),
+
+                PlaceBase::Static(ref s) => match s.kind {
+                    StaticKind::Static => (self.static_ty(s.def_id), Perm::move_(), None),
+                    StaticKind::Promoted(ref _p, _) => {
+                        // TODO: test this
+                        let pty = lv.ty(self.mir, self.cx.tcx);
+                        let ty = pty.ty;
+                        (self.local_ty(ty), Perm::read(), None)
+                    }
+                },
             }
         }
     }
 
     fn field_lty(&mut self, base_ty: ITy<'lty, 'tcx>, v: VariantIdx, f: Field) -> ITy<'lty, 'tcx> {
-        match base_ty.ty.sty {
+        match base_ty.ty.kind {
             TyKind::Adt(adt, _substs) => {
                 let field_def = &adt.variants[v].fields[f.index()];
                 let poly_ty = self.static_ty(field_def.did);
@@ -347,7 +401,7 @@ impl<'c, 'lty, 'a: 'lty, 'tcx: 'a> IntraCtxt<'c, 'lty, 'a, 'tcx> {
             },
             Rvalue::Discriminant(ref _lv) => unimplemented!(),
             Rvalue::Aggregate(ref kind, ref ops) => match **kind {
-                AggregateKind::Array(ty) => {
+                AggregateKind::Array(_elem_ty) => {
                     let array_ty = self.local_ty(ty);
                     for op in ops {
                         let (op_ty, op_perm) = self.operand_lty(op);
@@ -396,8 +450,8 @@ impl<'c, 'lty, 'a: 'lty, 'tcx: 'a> IntraCtxt<'c, 'lty, 'a, 'tcx> {
             Operand::Copy(ref lv) => self.place_lty(lv),
             Operand::Move(ref lv) => self.place_lty(lv),
             Operand::Constant(ref c) => {
-                eprintln!("CONSTANT {:?}: type = {:?}", c, c.ty);
-                let lty = self.local_ty(c.ty);
+                debug!("CONSTANT {:?}: type = {:?}", c, c.literal.ty);
+                let lty = self.local_ty(c.literal.ty);
                 if let Label::FnDef(inst_idx) = lty.label {
                     self.insts[inst_idx].span = Some(c.span);
                 }
@@ -449,7 +503,7 @@ impl<'c, 'lty, 'a: 'lty, 'tcx: 'a> IntraCtxt<'c, 'lty, 'a, 'tcx> {
     }
 
     fn propagate_perm(&mut self, p1: Perm<'lty>, p2: Perm<'lty>) {
-        eprintln!("ADD: {:?} <= {:?}", p1, p2);
+        debug!("ADD: {:?} <= {:?}", p1, p2);
         self.cset.add(p1, p2);
     }
 
@@ -482,7 +536,7 @@ impl<'c, 'lty, 'a: 'lty, 'tcx: 'a> IntraCtxt<'c, 'lty, 'a, 'tcx> {
     }
 
     fn ty_fn_sig(&mut self, ty: ITy<'lty, 'tcx>) -> IFnSig<'lty, 'tcx> {
-        match ty.ty.sty {
+        match ty.ty.kind {
             TyKind::FnDef(did, _substs) => {
                 let idx = expect!([ty.label] Label::FnDef(idx) => idx);
                 let var_base = self.insts[idx].first_inst_var;
@@ -506,12 +560,14 @@ impl<'c, 'lty, 'a: 'lty, 'tcx: 'a> IntraCtxt<'c, 'lty, 'a, 'tcx> {
                 FnSig {
                     inputs: self.ilcx.subst_slice(poly_inputs, ty.args),
                     output: self.ilcx.subst(poly_output, ty.args),
+                    is_variadic: sig.is_variadic,
                 }
             }
 
-            TyKind::FnPtr(_) => FnSig {
+            TyKind::FnPtr(ty_sig) => FnSig {
                 inputs: &ty.args[..ty.args.len() - 1],
                 output: ty.args[ty.args.len() - 1],
+                is_variadic: ty_sig.skip_binder().c_variadic,
             },
 
             TyKind::Closure(_, _) => unimplemented!(),
@@ -522,18 +578,18 @@ impl<'c, 'lty, 'a: 'lty, 'tcx: 'a> IntraCtxt<'c, 'lty, 'a, 'tcx> {
 
     pub fn handle_basic_block(&mut self, bbid: BasicBlock, bb: &BasicBlockData<'tcx>) {
         self.enter_block(bbid);
-        eprintln!("  {:?}", bbid);
+        debug!("  {:?}", bbid);
 
         for (idx, s) in bb.statements.iter().enumerate() {
             self.enter_stmt(idx);
             match s.kind {
-                StatementKind::Assign(ref lv, ref rv) => {
+                StatementKind::Assign(box(ref lv, ref rv)) => {
                     let (lv_ty, lv_perm) = self.place_lty(lv);
                     let (rv_ty, rv_perm) = self.rvalue_lty(rv);
                     self.propagate(lv_ty, rv_ty, rv_perm);
                     self.propagate_perm(Perm::write(), lv_perm);
-                    eprintln!("    {:?}: {:?}", lv, lv_ty);
-                    eprintln!("    ^-- {:?}: {:?}", rv, rv_ty);
+                    debug!("    {:?}: {:?}", lv, lv_ty);
+                    debug!("    ^-- {:?}: {:?}", rv, rv_ty);
                 },
                 StatementKind::FakeRead(..) |
                 StatementKind::SetDiscriminant { .. } |
@@ -571,8 +627,8 @@ impl<'c, 'lty, 'a: 'lty, 'tcx: 'a> IntraCtxt<'c, 'lty, 'a, 'tcx> {
                 let (val_ty, val_perm) = self.operand_lty(value);
                 self.propagate(loc_ty, val_ty, val_perm);
                 self.propagate_perm(Perm::write(), loc_perm);
-                eprintln!("    {:?}: {:?}", location, loc_ty);
-                eprintln!("    ^-- {:?}: {:?}", value, val_ty);
+                debug!("    {:?}: {:?}", location, loc_ty);
+                debug!("    ^-- {:?}: {:?}", value, val_ty);
             }
 
             TerminatorKind::Call {
@@ -581,25 +637,25 @@ impl<'c, 'lty, 'a: 'lty, 'tcx: 'a> IntraCtxt<'c, 'lty, 'a, 'tcx> {
                 ref destination,
                 ..
             } => {
-                eprintln!("    call {:?}", func);
+                debug!("    call {:?}", func);
                 let (func_ty, _func_perm) = self.operand_lty(func);
-                eprintln!("fty = {:?}", func_ty);
+                debug!("fty = {:?}", func_ty);
                 let sig = self.ty_fn_sig(func_ty);
 
                 // Note that `sig.inputs` may be shorter than `args`, if `func` is varargs.
                 for (&sig_ty, arg) in sig.inputs.iter().zip(args.iter()) {
                     let (arg_ty, arg_perm) = self.operand_lty(arg);
                     self.propagate(sig_ty, arg_ty, arg_perm);
-                    eprintln!("    (arg): {:?}", sig_ty);
-                    eprintln!("    ^-- {:?}: {:?}", arg, arg_ty);
+                    debug!("    (arg): {:?}", sig_ty);
+                    debug!("    ^-- {:?}: {:?}", arg, arg_ty);
                 }
                 if let Some((ref dest, _)) = *destination {
                     let sig_ty = sig.output;
                     let (dest_ty, dest_perm) = self.place_lty(dest);
                     self.propagate(dest_ty, sig_ty, Perm::move_());
                     self.propagate_perm(Perm::write(), dest_perm);
-                    eprintln!("    {:?}: {:?}", dest, dest_ty);
-                    eprintln!("    ^-- (return): {:?}", sig_ty);
+                    debug!("    {:?}: {:?}", dest, dest_ty);
+                    debug!("    ^-- (return): {:?}", sig_ty);
                 }
             }
         }

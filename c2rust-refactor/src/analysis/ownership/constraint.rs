@@ -64,7 +64,7 @@ impl<'lty, 'tcx> Perm<'lty> {
     /// Construct the minimum of two permissions.  This needs a reference to the arena, since it
     /// may need to allocate a new slice for `Min`.
     pub fn min(a: Perm<'lty>, b: Perm<'lty>, arena: &'lty SyncDroplessArena) -> Perm<'lty> {
-        eprintln!("finding min of {:?} and {:?}", a, b);
+        debug!("finding min of {:?} and {:?}", a, b);
         match (a, b) {
             // A few easy cases
             (Perm::Concrete(ConcretePerm::Read), _) | (_, Perm::Concrete(ConcretePerm::Read)) => {
@@ -82,12 +82,12 @@ impl<'lty, 'tcx> Perm<'lty> {
                         all.push(p);
                     }
                 }
-                let all = if all.len() == 0 {
+                let all = if all.is_empty() {
                     &[] as &[_]
                 } else {
                     arena.alloc_slice(&all)
                 };
-                eprintln!("nontrivial min: {:?}", all);
+                debug!("nontrivial min: {:?}", all);
                 Perm::Min(all)
             }
 
@@ -98,12 +98,12 @@ impl<'lty, 'tcx> Perm<'lty> {
                     let mut all = Vec::with_capacity(ps.len() + 1);
                     all.extend(ps.iter().cloned());
                     all.push(p);
-                    let all = if all.len() == 0 {
+                    let all = if all.is_empty() {
                         &[] as &[_]
                     } else {
                         arena.alloc_slice(&all)
                     };
-                    eprintln!("nontrivial min: {:?}", all);
+                    debug!("nontrivial min: {:?}", all);
                     Perm::Min(all)
                 }
             }
@@ -113,7 +113,7 @@ impl<'lty, 'tcx> Perm<'lty> {
                     a
                 } else {
                     let all = arena.alloc_slice(&[a, b]);
-                    eprintln!("nontrivial min: {:?}", all);
+                    debug!("nontrivial min: {:?}", all);
                     Perm::Min(all)
                 }
             }
@@ -459,6 +459,8 @@ impl<'lty, 'tcx> ConstraintSet<'lty> {
                 continue;
             }
 
+            debug!("Constraint {:?} <= {:?} is not satisfiable", a, b);
+
             return false;
         }
 
@@ -470,7 +472,7 @@ impl<'lty, 'tcx> ConstraintSet<'lty> {
         let to_visit = self.less.iter().cloned().collect();
         EditConstraintSet {
             cset: self,
-            to_visit: to_visit,
+            to_visit,
         }
     }
 
@@ -579,7 +581,7 @@ impl<'lty, 'tcx> ConstraintSet<'lty> {
                 _ => continue,
             };
 
-            if ps.len() == 0 {
+            if ps.is_empty() {
                 // Should never happen, but just in case...
                 edit.remove(a, b);
                 continue;

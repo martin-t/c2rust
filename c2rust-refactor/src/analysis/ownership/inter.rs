@@ -4,6 +4,7 @@ use std::collections::hash_map::{Entry, HashMap};
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
+use log::Level;
 use rustc::hir::def_id::DefId;
 
 use super::constraint::{ConstraintSet, Perm};
@@ -54,7 +55,7 @@ pub struct InterCtxt<'c, 'lty, 'tcx> {
 impl<'c, 'lty, 'tcx> InterCtxt<'c, 'lty, 'tcx> {
     pub fn new(cx: &'c mut Ctxt<'lty, 'tcx>) -> InterCtxt<'c, 'lty, 'tcx> {
         InterCtxt {
-            cx: cx,
+            cx,
             complete_cset: HashMap::new(),
             work_list: WorkList::new(),
             rev_deps: HashMap::new(),
@@ -76,14 +77,11 @@ impl<'c, 'lty, 'tcx> InterCtxt<'c, 'lty, 'tcx> {
 
         // Add constraints for all used static vars.
         let mut used_statics = HashSet::new();
-        cset.for_each_perm(|p| match p {
-            Perm::StaticVar(v) => {
-                used_statics.insert(v);
-            }
-            _ => {}
+        cset.for_each_perm(|p| if let Perm::StaticVar(v) = p {
+            used_statics.insert(v);
         });
         for &v in &used_statics {
-            eprintln!("  import static: {:?} = {:?}", v, self.cx.static_assign[v]);
+            debug!("  import static: {:?} = {:?}", v, self.cx.static_assign[v]);
             cset.add(Perm::Concrete(self.cx.static_assign[v]), Perm::StaticVar(v));
             self.static_rev_deps
                 .entry(v)
@@ -95,7 +93,7 @@ impl<'c, 'lty, 'tcx> InterCtxt<'c, 'lty, 'tcx> {
         let arena = self.cx.arena;
         for inst in &self.cx.first_variant_summ(def_id).1.insts {
             let complete = self.complete_cset.get(&inst.callee).unwrap_or(&dummy_cset);
-            eprintln!(
+            debug!(
                 "  instantiate {:?} for vars {}..",
                 inst.callee, inst.first_inst_var
             );
@@ -111,9 +109,11 @@ impl<'c, 'lty, 'tcx> InterCtxt<'c, 'lty, 'tcx> {
         }
 
         // Simplify away inst vars to produce a new complete cset for this fn.
-        eprintln!("  original constraints:");
-        for &(a, b) in cset.iter() {
-            eprintln!("    {:?} <= {:?}", a, b);
+        debug!("  original constraints:");
+        if log_enabled!(Level::Debug) {
+            for &(a, b) in cset.iter() {
+                debug!("    {:?} <= {:?}", a, b);
+            }
         }
 
         cset.remove_useless();
@@ -124,16 +124,18 @@ impl<'c, 'lty, 'tcx> InterCtxt<'c, 'lty, 'tcx> {
             _ => true,
         });
 
-        eprintln!("  simplified constraints:");
-        for &(a, b) in cset.iter() {
-            eprintln!("    {:?} <= {:?}", a, b);
+        debug!("  simplified constraints:");
+        if log_enabled!(Level::Debug) {
+            for &(a, b) in cset.iter() {
+                debug!("    {:?} <= {:?}", a, b);
+            }
         }
 
         // Update `cx.static_assign`
         for &v in &used_statics {
             let old = self.cx.static_assign[v];
             let new = cset.lower_bound(Perm::StaticVar(v));
-            eprintln!("  static {:?}: {:?} -> {:?}", v, old, new);
+            debug!("  static {:?}: {:?} -> {:?}", v, old, new);
             if new > old {
                 self.cx.static_assign[v] = new;
                 if let Some(rev_deps) = self.static_rev_deps.get(&v) {
@@ -158,9 +160,11 @@ impl<'c, 'lty, 'tcx> InterCtxt<'c, 'lty, 'tcx> {
     fn process_one(&mut self, def_id: DefId) {
         let cset = self.compute_one_cset(def_id);
 
-        eprintln!("save cset for {:?}", def_id);
-        for &(a, b) in cset.iter() {
-            eprintln!("  {:?} <= {:?}", a, b);
+        debug!("save cset for {:?}", def_id);
+        if log_enabled!(Level::Debug) {
+            for &(a, b) in cset.iter() {
+                debug!("  {:?} <= {:?}", a, b);
+            }
         }
 
         // Update `complete_cset`
@@ -192,16 +196,16 @@ impl<'c, 'lty, 'tcx> InterCtxt<'c, 'lty, 'tcx> {
         let mut idx = 0;
 
         let ids = self.cx.func_ids().collect::<Vec<_>>();
-        eprintln!("\ninterprocedural analysis: process {} fns", ids.len());
+        debug!("\ninterprocedural analysis: process {} fns", ids.len());
         for id in ids {
-            eprintln!("process {} (init): {:?}", idx, id);
+            debug!("process {} (init): {:?}", idx, id);
             idx += 1;
 
             self.process_one(id);
         }
 
         while let Some(id) = self.work_list.pop() {
-            eprintln!("process {}: {:?}", idx, id);
+            debug!("process {}: {:?}", idx, id);
             idx += 1;
 
             self.process_one(id);

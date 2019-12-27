@@ -1,14 +1,14 @@
 use c2rust_ast_exporter::clang_ast::LRValue;
 use indexmap::{IndexMap, IndexSet};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::cmp::Ordering;
 use std::fmt::{self, Debug, Display};
-use std::iter::FromIterator;
 use std::mem;
 use std::ops::Index;
 use std::path::{Path, PathBuf};
 
-pub use c2rust_ast_exporter::clang_ast::{SrcFile, SrcLoc};
+pub use c2rust_ast_exporter::clang_ast::{SrcFile, SrcLoc, SrcSpan, BuiltinVaListKind};
 
 #[derive(Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Copy, Clone)]
 pub struct CTypeId(pub u64);
@@ -34,11 +34,12 @@ pub type CEnumConstantId = CDeclId; // Enum's need to point to child 'DeclKind::
 
 pub use self::conversion::*;
 pub use self::print::Printer;
-use super::diagnostics::Diagnostic;
 
 mod conversion;
 pub mod iterators;
 mod print;
+
+use iterators::{DFNodes, SomeId};
 
 /// AST context containing all of the nodes in the Clang AST
 #[derive(Debug, Clone)]
@@ -73,25 +74,26 @@ pub struct TypedAstContext {
     // The key is the typedef decl being squashed away,
     // and the value is the decl id to the corresponding structure
     pub prenamed_decls: IndexMap<CDeclId, CDeclId>,
+
+    pub va_list_kind: BuiltinVaListKind,
 }
 
 /// Comments associated with a typed AST context
 #[derive(Debug, Clone)]
 pub struct CommentContext {
-    decl_comments: HashMap<CDeclId, Vec<String>>,
-    stmt_comments: HashMap<CStmtId, Vec<String>>,
+    comments_by_file: HashMap<FileId, RefCell<Vec<Located<String>>>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct DisplaySrcLoc {
+pub struct DisplaySrcSpan {
     file: Option<PathBuf>,
-    loc: SrcLoc,
+    loc: SrcSpan,
 }
 
-impl Display for DisplaySrcLoc {
+impl Display for DisplaySrcSpan {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if let Some(ref file) = self.file {
-            write!(f, "{}:{}:{}", file.display(), self.loc.line, self.loc.column)
+            write!(f, "{}:{}:{}", file.display(), self.loc.begin_line, self.loc.begin_column)
         } else {
             Debug::fmt(self, f)
         }
@@ -103,15 +105,26 @@ pub type FileId = usize;
 /// Represents some AST node possibly with source location information bundled with it
 #[derive(Debug, Clone)]
 pub struct Located<T> {
-    pub loc: Option<SrcLoc>,
+    pub loc: Option<SrcSpan>,
     pub kind: T,
 }
 
+impl<T> Located<T> {
+    pub fn begin_loc(&self) -> Option<SrcLoc> {
+        self.loc.map(|loc| loc.begin())
+    }
+    pub fn end_loc(&self) -> Option<SrcLoc> {
+        self.loc.map(|loc| loc.end())
+    }
+}
+
 impl TypedAstContext {
+    // TODO: build the TypedAstContext during initialization, rather than
+    // building an empty one and filling it later.
     pub fn new(clang_files: &[SrcFile]) -> TypedAstContext {
         let mut files: Vec<SrcFile> = vec![];
         let mut file_map: Vec<FileId> = vec![];
-        for file in clang_files.into_iter() {
+        for file in clang_files {
             if let Some(existing) = files.iter().position(|f| f.path == file.path) {
                 file_map.push(existing);
             } else {
@@ -130,7 +143,7 @@ impl TypedAstContext {
                     line: include_loc.line,
                     column: include_loc.column,
                 });
-                cur = &files[file_map[include_loc.fileid as usize]];
+                cur = &clang_files[include_loc.fileid as usize];
             }
             include_path.reverse();
             include_map.push(include_path);
@@ -152,12 +165,13 @@ impl TypedAstContext {
 
             comments: vec![],
             prenamed_decls: IndexMap::new(),
+            va_list_kind: BuiltinVaListKind::CharPtrBuiltinVaList,
         }
     }
 
-    pub fn display_loc(&self, loc: &Option<SrcLoc>) -> Option<DisplaySrcLoc> {
+    pub fn display_loc(&self, loc: &Option<SrcSpan>) -> Option<DisplaySrcSpan> {
         loc.as_ref().map(|loc| {
-            DisplaySrcLoc {
+            DisplaySrcSpan {
                 file: self.files[self.file_map[loc.fileid as usize]].path.clone(),
                 loc: loc.clone(),
             }
@@ -209,7 +223,16 @@ impl TypedAstContext {
     }
 
     pub fn file_id<T>(&self, located: &Located<T>) -> Option<FileId> {
-        located.loc.as_ref().map(|loc| self.file_map[loc.fileid as usize])
+        located.loc.as_ref().and_then(|loc| self.file_map.get(loc.fileid as usize).copied())
+    }
+
+    pub fn get_src_loc(&self, id: SomeId) -> Option<SrcSpan> {
+        match id {
+            SomeId::Stmt(id) => self.index(id).loc,
+            SomeId::Expr(id) => self.index(id).loc,
+            SomeId::Decl(id) => self.index(id).loc,
+            SomeId::Type(id) => self.index(id).loc,
+        }
     }
 
     pub fn iter_decls(&self) -> indexmap::map::Iter<CDeclId, CDecl> {
@@ -256,6 +279,73 @@ impl TypedAstContext {
         }
     }
 
+    /// Follow a chain of typedefs and return true iff the last typedef is named
+    /// `__buitin_va_list` thus naming the type clang uses to represent `va_list`s.
+    pub fn is_builtin_va_list(&self, typ: CTypeId) -> bool {
+        match self.index(typ).kind {
+            CTypeKind::Typedef(decl) => match &self.index(decl).kind {
+                    CDeclKind::Typedef { name: nam, typ: ty, .. } => {
+                        if nam == "__builtin_va_list" {
+                            true
+                        } else {
+                            self.is_builtin_va_list(ty.ctype)
+                        }
+                    },
+                    _ => panic!("Typedef decl did not point to a typedef"),
+            },
+            _ => false,
+        }
+    }
+
+    /// Predicate for types that are used to implement C's `va_list`.
+    /// FIXME: can we get rid of this method and use `is_builtin_va_list` instead?
+    pub fn is_va_list_struct(&self, typ: CTypeId) -> bool {
+        // detect `va_list`s based on typedef (should work across implementations)
+//        if self.is_builtin_va_list(typ) {
+//            return true;
+//        }
+
+        // detect `va_list`s based on type (assumes struct-based implementation)
+        let resolved_ctype = self.resolve_type(typ);
+        match resolved_ctype.kind {
+            CTypeKind::Struct(record_id) => {
+                let r#struct = &self[record_id];
+                if let CDeclKind::Struct { name: Some(ref nam), .. } = r#struct.kind {
+                    return nam == "__va_list_tag" || nam == "__va_list"
+                } else {
+                    false
+                }
+            },
+            // va_list is a 1 element array; return true iff element type is struct __va_list_tag
+            CTypeKind::ConstantArray(typ, 1) => {
+                return self.is_va_list(typ);
+            },
+            _ => false
+        }
+    }
+
+    /// Predicate for pointers to types that are used to implement C's `va_list`.
+    pub fn is_va_list(&self, typ: CTypeId) -> bool {
+        match self.va_list_kind {
+            BuiltinVaListKind::CharPtrBuiltinVaList | BuiltinVaListKind::VoidPtrBuiltinVaList
+            | BuiltinVaListKind::X86_64ABIBuiltinVaList => {
+                match self.resolve_type(typ).kind {
+                    CTypeKind::Pointer(CQualTypeId { ctype, .. })
+                    | CTypeKind::ConstantArray(ctype, _) => {
+                        self.is_va_list_struct(ctype)
+                    }
+                    _ => false,
+                }
+            }
+
+            BuiltinVaListKind::AArch64ABIBuiltinVaList => {
+                self.is_va_list_struct(typ)
+            }
+
+            kind => unimplemented!("va_list type {:?} not yet implemented", kind),
+        }
+    }
+
     /// Predicate for function pointers
     pub fn is_function_pointer(&self, typ: CTypeId) -> bool {
         let resolved_ctype = self.resolve_type(typ);
@@ -268,34 +358,6 @@ impl TypedAstContext {
         } else {
             false
         }
-    }
-
-    pub fn is_va_list(&self, typ: CTypeId) -> bool {
-        match self.resolve_type(typ).kind {
-            CTypeKind::Struct(struct_id) => {
-                if let CDeclKind::Struct {
-                    name: Some(ref struct_name),
-                    ..
-                } = self[struct_id].kind {
-                    if struct_name == "__va_list_tag" {
-                        return true;
-                    }
-                }
-            }
-
-            // va_list is a 1 element array of type struct __va_list_tag
-            CTypeKind::ConstantArray(typ, 1) => {
-                return self.is_va_list(typ);
-            }
-
-            // Allow a decayed reference to the array to count as a va_list
-            CTypeKind::Pointer(pointee_qty) => {
-                return self.is_va_list(pointee_qty.ctype);
-            }
-
-            _ => {}
-        }
-        false
     }
 
     /// Can the given field decl be a flexible array member?
@@ -316,6 +378,19 @@ impl TypedAstContext {
             Some(p)
         } else {
             None
+        }
+    }
+
+    /// Resolve expression value, ignoring any casts
+    pub fn resolve_expr_value(&self, expr_id: CExprId) -> &CExprKind {
+        let expr = &self.index(expr_id).kind;
+        match expr {
+            CExprKind::ImplicitCast(_, subexpr, _, _, _) |
+            CExprKind::ExplicitCast(_, subexpr, _, _, _) |
+            CExprKind::Paren(_, subexpr) => {
+                self.resolve_expr_value(*subexpr)
+            }
+            _ => expr
         }
     }
 
@@ -385,7 +460,8 @@ impl TypedAstContext {
             CExprKind::ImplicitValueInit { .. } |
             CExprKind::Predefined(..) |
             CExprKind::Statements(..) | // TODO: more precision
-            CExprKind::VAArg(..) => false,
+            CExprKind::VAArg(..) |
+            CExprKind::Atomic{..} => false,
 
             CExprKind::Literal(_, _) |
             CExprKind::DeclRef(_, _, _) |
@@ -434,7 +510,6 @@ impl TypedAstContext {
     }
 
     pub fn prune_unused_decls(&mut self) {
-        use self::iterators::{DFNodes, SomeId};
         // Starting from a set of root declarations, walk each one to find declarations it
         // depends on. Then walk each of those, recursively.
 
@@ -568,143 +643,148 @@ impl TypedAstContext {
                 (None, None) => Ordering::Equal,
                 (None, _) => Ordering::Less,
                 (_, None) => Ordering::Greater,
-                (Some(a), Some(b)) => self.compare_src_locs(a, b),
+                (Some(a), Some(b)) => self.compare_src_locs(&a.begin(), &b.begin()),
             }
         });
         self.c_decls_top = decls_top;
+    }
+
+    pub fn has_inner_struct_decl(&self, decl_id: CDeclId) -> bool {
+        match self.index(decl_id).kind {
+            CDeclKind::Struct { manual_alignment: Some(_), .. } => true,
+            _ => false
+        }
+    }
+
+    pub fn is_packed_struct_decl(&self, decl_id: CDeclId) -> bool {
+        match self.index(decl_id).kind {
+            CDeclKind::Struct { is_packed: true, .. } => true,
+            CDeclKind::Struct { max_field_alignment: Some(_), .. } => true,
+            _ => false
+        }
+    }
+
+    pub fn is_aligned_struct_type(&self, typ: CTypeId) -> bool {
+        if let Some(decl_id) = self
+            .resolve_type(typ)
+            .kind
+            .as_underlying_decl()
+        {
+            if let CDeclKind::Struct {
+                manual_alignment: Some(_),
+                ..
+            } = self.index(decl_id).kind {
+                return true;
+            }
+        }
+        false
     }
 }
 
 impl CommentContext {
     pub fn empty() -> CommentContext {
         CommentContext {
-            decl_comments: HashMap::new(),
-            stmt_comments: HashMap::new(),
+            comments_by_file: HashMap::new(),
         }
     }
 
-    // Try to match up every comment with a declaration or a statement
+    /// Build a CommentContext from the comments in this `ast_context`
     pub fn new(ast_context: &mut TypedAstContext) -> CommentContext {
-        // Group and sort declarations by file and by position
-        let mut decls: HashMap<u64, Vec<(SrcLoc, CDeclId)>> = HashMap::new();
-        for (decl_id, ref loc_decl) in &ast_context.c_decls {
-            if let Some(ref loc) = loc_decl.loc {
-                decls
-                    .entry(loc.fileid)
-                    .or_insert(vec![])
-                    .push((loc.clone(), *decl_id));
-            }
-        }
-        decls.iter_mut().for_each(|(_, v)| v.sort());
+        let mut comments_by_file: HashMap<FileId, Vec<Located<String>>> = HashMap::new();
 
-        // Group and sort statements by file and by position
-        let mut stmts: HashMap<u64, Vec<(SrcLoc, CStmtId)>> = HashMap::new();
-        for (stmt_id, ref loc_stmt) in &ast_context.c_stmts {
-            if let Some(ref loc) = loc_stmt.loc {
-                stmts
-                    .entry(loc.fileid)
-                    .or_insert(vec![])
-                    .push((loc.clone(), *stmt_id));
-            }
-        }
-        stmts.iter_mut().for_each(|(_, v)| v.sort());
-
-        let mut decl_comments_map: HashMap<CDeclId, BTreeMap<SrcLoc, String>> = HashMap::new();
-        let mut stmt_comments_map: HashMap<CStmtId, BTreeMap<SrcLoc, String>> = HashMap::new();
-
-        let empty_vec1 = &vec![];
-        let empty_vec2 = &vec![];
-
-        // Match comments to declarations and statements
-        while let Some(Located { loc, kind: comment }) = ast_context.comments.pop() {
-            if let Some(loc) = loc {
-                let this_file_decls = decls.get(&loc.fileid).unwrap_or(empty_vec1);
-                let this_file_stmts = stmts.get(&loc.fileid).unwrap_or(empty_vec2);
-
-                // Find the closest declaration and statement
-                let decl_ix = this_file_decls
-                    .binary_search_by_key(&loc.line, |&(ref l, _)| l.line)
-                    .unwrap_or_else(|x| x);
-                let stmt_ix = this_file_stmts
-                    .binary_search_by_key(&loc.line, |&(ref l, _)| l.line)
-                    .unwrap_or_else(|x| x);
-
-                let mut insert_decl_comment = |decl_id: CDeclId, loc, comment| {
-                    let decl_id = if let CDeclKind::NonCanonicalDecl { canonical_decl } = ast_context[decl_id].kind {
-                        canonical_decl
-                    } else {
-                        decl_id
-                    };
-                    decl_comments_map
-                        .entry(decl_id)
-                        .or_insert(BTreeMap::new())
-                        .insert(loc, comment);
-                };
-                let mut insert_stmt_comment = |stmt_id: CStmtId, loc, comment| {
-                    stmt_comments_map
-                        .entry(stmt_id)
-                        .or_insert(BTreeMap::new())
-                        .insert(loc, comment);
-                };
-
-                // Prefer the one that is higher up (biasing towards declarations if there is a tie)
-                match (this_file_decls.get(decl_ix), this_file_stmts.get(stmt_ix)) {
-                    (Some(&(ref l1, d)), Some(&(ref l2, s))) => {
-                        if l1 > l2 {
-                            insert_stmt_comment(s, loc, comment);
-                        } else {
-                            insert_decl_comment(d, loc, comment);
-                        }
-                    }
-                    (Some(&(_, d)), None) => {
-                        insert_decl_comment(d, loc, comment);
-                    }
-                    (None, Some(&(_, s))) => {
-                            insert_stmt_comment(s, loc, comment);
-                    }
-                    (None, None) => {
-                        diag!(
-                            Diagnostic::Comments,
-                            "Didn't find a target node for the comment '{}'",
-                            comment,
-                        );
-                    }
-                };
+        // Group comments by their file
+        for comment in &ast_context.comments {
+            // Comments without a valid FileId are probably clang
+            // compiler-internal definitions
+            if let Some(file_id) = ast_context.file_id(&comment) {
+                comments_by_file
+                    .entry(file_id)
+                    .or_default()
+                    .push(comment.clone());
             }
         }
 
-        // Flatten out the nested comment maps
-        let decl_comments = decl_comments_map
+        // Sort in REVERSE! Last element is the first in file source
+        // ordering. This makes it easy to pop the next comment off.
+        for comments in comments_by_file.values_mut() {
+            comments.sort_by(|a, b| {
+                ast_context.compare_src_locs(
+                    &b.loc.unwrap().begin(),
+                    &a.loc.unwrap().begin(),
+                )
+            });
+        }
+
+        let comments_by_file = comments_by_file
             .into_iter()
-            .map(|(decl_id, map)| {
-                let mut comments = Vec::from_iter(map);
-                // Sort comments attached to this decl by source location
-                comments.sort_unstable_by(|a, b| {
-                    ast_context.compare_src_locs(&a.0, &b.0)
-                });
-
-                (decl_id, comments.into_iter().map(|(_, v)| v).collect())
-            })
-            .collect();
-        let stmt_comments = stmt_comments_map
-            .into_iter()
-            .map(|(decl_id, map)| (decl_id, map.into_iter().map(|(_, v)| v).collect()))
+            .map(|(k, v)| (k, RefCell::new(v)))
             .collect();
 
         CommentContext {
-            decl_comments,
-            stmt_comments,
+            comments_by_file,
         }
     }
 
-    // Extract the comment for a given declaration
-    pub fn get_decl_comment(&self, decl_id: CDeclId) -> Option<&[String]> {
-        self.decl_comments.get(&decl_id).map(Vec::as_ref)
+    pub fn get_comments_before(&self, loc: SrcLoc, ctx: &TypedAstContext) -> Vec<String> {
+        let file_id = ctx.file_map[loc.fileid as usize];
+        let mut extracted_comments = vec![];
+        let mut comments = match self.comments_by_file.get(&file_id) {
+            None => return extracted_comments,
+            Some(comments) => comments.borrow_mut(),
+        };
+        while !comments.is_empty() {
+            let next_comment_loc = comments
+                .last()
+                .unwrap()
+                .begin_loc()
+                .expect("All comments must have a source location");
+            if ctx.compare_src_locs(&next_comment_loc, &loc) != Ordering::Less {
+                break;
+            }
+
+            extracted_comments.push(comments.pop().unwrap().kind);
+        }
+        extracted_comments
     }
 
-    // Extract the comment for a given statement
-    pub fn get_stmt_comment(&self, stmt_id: CStmtId) -> Option<&[String]> {
-        self.stmt_comments.get(&stmt_id).map(Vec::as_ref)
+    pub fn get_comments_before_located<T>(
+        &self,
+        located: &Located<T>,
+        ctx: &TypedAstContext,
+    ) -> Vec<String> {
+        match located.begin_loc() {
+            None => vec![],
+            Some(loc) => self.get_comments_before(loc, ctx),
+        }
+    }
+
+    pub fn peek_next_comment_on_line(&self, loc: SrcLoc, ctx: &TypedAstContext) -> Option<Located<String>> {
+        let file_id = ctx.file_map[loc.fileid as usize];
+        let comments = self.comments_by_file.get(&file_id)?.borrow();
+        comments.last().and_then(|comment| {
+            let next_comment_loc = comment
+                .begin_loc()
+                .expect("All comments must have a source location");
+            if next_comment_loc.line != loc.line {
+                None
+            } else {
+                Some(comment.clone())
+            }
+        })
+    }
+
+    /// Advance over the current comment in `file`
+    pub fn advance_comment(&self, file: FileId) {
+        if let Some(comments) = self.comments_by_file.get(&file) {
+            let _ = comments.borrow_mut().pop();
+        }
+    }
+
+    pub fn get_remaining_comments(&mut self, file_id: FileId) -> Vec<String> {
+        match self.comments_by_file.remove(&file_id) {
+            Some(comments) => comments.into_inner().into_iter().map(|c| c.kind).collect(),
+            None => vec![],
+        }
     }
 }
 
@@ -973,6 +1053,18 @@ pub enum CExprKind {
     // GNU choose expr. Condition, true expr, false expr, was condition true?
     Choose(CQualTypeId, CExprId, CExprId, CExprId, bool),
 
+    // GNU/C11 atomic expr
+    Atomic {
+        typ: CQualTypeId,
+        name: String,
+        ptr: CExprId,
+        order: CExprId,
+        val1: Option<CExprId>,
+        order_fail: Option<CExprId>,
+        val2: Option<CExprId>,
+        weak: Option<CExprId>,
+    },
+
     BadExpr,
 }
 
@@ -1021,7 +1113,8 @@ impl CExprKind {
             | CExprKind::ShuffleVector(ty, _)
             | CExprKind::ConvertVector(ty, _)
             | CExprKind::DesignatedInitExpr(ty, _, _) => Some(ty),
-            | CExprKind::Choose(ty, _, _, _, _) => Some(ty),
+            | CExprKind::Choose(ty, _, _, _, _)
+            | CExprKind::Atomic{typ: ty, ..} => Some(ty),
         }
     }
 
@@ -1473,6 +1566,8 @@ pub enum Attribute {
     Section(String),
     /// __attribute__((used, __used__))
     Used,
+    /// __attribute((visibility("hidden")))
+    Visibility(String),
 }
 
 impl CTypeKind {

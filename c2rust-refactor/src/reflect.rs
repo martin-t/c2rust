@@ -29,12 +29,12 @@ fn reflect_tcx_ty_inner<'a, 'gcx, 'tcx>(
     infer_args: bool,
 ) -> P<Ty> {
     use rustc::ty::TyKind::*;
-    match ty.sty {
+    match ty.kind {
         Bool => mk().ident_ty("bool"),
         Char => mk().ident_ty("char"),
-        Int(ity) => mk().ident_ty(ity.ty_to_string()),
-        Uint(uty) => mk().ident_ty(uty.ty_to_string()),
-        Float(fty) => mk().ident_ty(fty.ty_to_string()),
+        Int(ity) => mk().ident_ty(ity.name()),
+        Uint(uty) => mk().ident_ty(uty.name()),
+        Float(fty) => mk().ident_ty(fty.name()),
         Adt(def, substs) => {
             if infer_args {
                 let (qself, path) = reflect_def_path(tcx, def.did);
@@ -52,7 +52,7 @@ fn reflect_tcx_ty_inner<'a, 'gcx, 'tcx>(
         Str => mk().ident_ty("str"),
         Array(ty, len) => mk().array_ty(
             reflect_tcx_ty(tcx, ty),
-            mk().lit_expr(mk().int_lit(len.unwrap_usize(tcx) as u128, "usize")),
+            mk().lit_expr(mk().int_lit(len.eval_usize(tcx, ty::ParamEnv::empty()) as u128, "usize")),
         ),
         Slice(ty) => mk().slice_ty(reflect_tcx_ty(tcx, ty)),
         RawPtr(mty) => mk()
@@ -97,7 +97,7 @@ pub fn anon_const_to_expr(hir_map: &HirMap, def_id: DefId) -> P<Expr> {
 
 fn hir_expr_to_expr(e: &hir::Expr) -> P<Expr> {
     use rustc::hir::ExprKind::*;
-    match e.node {
+    match e.kind {
         Binary(op, ref a, ref b) => {
             let op: BinOpKind = op.node.into();
             mk().binary_expr(op, hir_expr_to_expr(a), hir_expr_to_expr(b))
@@ -164,7 +164,7 @@ fn reflect_def_path_inner<'a, 'gcx, 'tcx>(
                     reflect_tcx_ty_inner(tcx, ty, true)
                 };
 
-                match ast_ty.node {
+                match ast_ty.kind {
                     TyKind::Path(ref ty_qself, ref ty_path) => {
                         qself = ty_qself.clone();
                         segments.extend(ty_path.segments.iter().rev().cloned());
@@ -182,7 +182,7 @@ fn reflect_def_path_inner<'a, 'gcx, 'tcx>(
             }
 
             DefPathData::ValueNs(name) => {
-                if segments.len() == 0 {
+                if segments.is_empty() {
                     if name.as_str() != "" {
                         segments.push(mk().path_segment(name));
                     }
@@ -195,8 +195,7 @@ fn reflect_def_path_inner<'a, 'gcx, 'tcx>(
                 }
             }
 
-            DefPathData::TypeNs(name)
-            | DefPathData::GlobalMetaData(name) => {
+            DefPathData::TypeNs(name) => {
                 if name.as_str() != "" {
                     segments.push(mk().path_segment(name));
                 }
@@ -226,9 +225,9 @@ fn reflect_def_path_inner<'a, 'gcx, 'tcx>(
             // panic if the def cannot be generic. This is a list of
             // DefKinds that can have generic type params.
             Some(DefKind::Struct) | Some(DefKind::Union) | Some(DefKind::Enum)
-                | Some(DefKind::Variant) | Some(DefKind::Trait) | Some(DefKind::Existential)
+                | Some(DefKind::Variant) | Some(DefKind::Trait) | Some(DefKind::OpaqueTy)
                 | Some(DefKind::TyAlias) | Some(DefKind::ForeignTy) | Some(DefKind::TraitAlias)
-                | Some(DefKind::AssocTy) | Some(DefKind::AssocExistential)
+                | Some(DefKind::AssocTy) | Some(DefKind::AssocOpaqueTy)
                 | Some(DefKind::TyParam) | Some(DefKind::Fn) | Some(DefKind::Method)
                 | Some(DefKind::Ctor(..)) => {
                     let gen = tcx.generics_of(id);
@@ -242,7 +241,7 @@ fn reflect_def_path_inner<'a, 'gcx, 'tcx>(
                         })
                         .count();
                     if let Some(substs) = opt_substs {
-                        if substs.len() > 0 {
+                        if !substs.is_empty() {
                             assert!(substs.len() >= num_params);
                             let start = substs.len() - num_params;
                             let tys = substs[start..]
@@ -300,6 +299,7 @@ pub fn can_reflect_path(cx: &RefactorCtxt, id: NodeId) -> bool {
         | Node::TraitRef(_)
         | Node::Pat(_)
         | Node::Arm(_)
+        | Node::Param(_)
         | Node::Block(_)
         | Node::Lifetime(_)
         | Node::Visibility(_)
@@ -323,7 +323,7 @@ fn register_test_reflect(reg: &mut Registry) {
                 MutVisitNodes::visit(krate, |e: &mut P<Expr>| {
                     let ty = cx.node_type(e.id);
 
-                    let new_expr = if let TyKind::FnDef(def_id, ref substs) = ty.sty {
+                    let new_expr = if let TyKind::FnDef(def_id, ref substs) = ty.kind {
                         let substs = substs.types().collect::<Vec<_>>();
                         let (qself, path) =
                             reflect_def_path_inner(cx.ty_ctxt(), def_id, Some(&substs));

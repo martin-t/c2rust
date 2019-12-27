@@ -8,18 +8,20 @@ use std::io;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::c_ast::DisplaySrcLoc;
+use crate::c_ast::{ClangAstParseErrorKind, DisplaySrcSpan};
 use c2rust_ast_exporter::get_clang_major_version;
 
-const DEFAULT_WARNINGS: &[Diagnostic] = &[];
+const DEFAULT_WARNINGS: &[Diagnostic] = &[Diagnostic::ClangAst];
 
 #[derive(PartialEq, Eq, Hash, Debug, Display, EnumString, Clone)]
 #[strum(serialize_all = "kebab_case")]
 pub enum Diagnostic {
     All,
     Comments,
+    ClangAst,
 }
 
+#[allow(unused_macros)]
 macro_rules! diag {
     ($type:path, $($arg:tt)*) => (warn!(target: &$type.to_string(), $($arg)*))
 }
@@ -68,7 +70,7 @@ pub fn init(mut enabled_warnings: HashSet<Diagnostic>, log_level: log::LevelFilt
 
 #[derive(Debug, Clone)]
 pub struct TranslationError {
-    loc: Vec<DisplaySrcLoc>,
+    loc: Vec<DisplaySrcSpan>,
     inner: Arc<Context<TranslationErrorKind>>,
 }
 
@@ -81,6 +83,9 @@ pub enum TranslationErrorKind {
 
     // We are waiting for va_copy support to land in rustc
     VaCopyNotImplemented,
+
+    // Clang AST exported by AST-exporter was not valid
+    InvalidClangAst(ClangAstParseErrorKind),
 }
 
 /// Constructs a `TranslationError` using the standard string interpolation syntax.
@@ -111,6 +116,10 @@ impl Display for TranslationErrorKind {
 
             VaCopyNotImplemented => {
                 return write!(f, "Rust does not yet support a C-compatible va_copy which is required to translate this function. See https://github.com/rust-lang/rust/pull/59625");
+            }
+
+            InvalidClangAst(_) => {
+                return write!(f, "Exported Clang AST was invalid. Check warnings above for unimplemented features.");
             }
         }
         Ok(())
@@ -148,7 +157,7 @@ impl TranslationError {
         self.inner.get_context().clone()
     }
 
-    pub fn new(loc: Option<DisplaySrcLoc>, inner: Context<TranslationErrorKind>) -> Self {
+    pub fn new(loc: Option<DisplaySrcSpan>, inner: Context<TranslationErrorKind>) -> Self {
         let mut loc_stack = vec![];
         if let Some(loc) = loc {
             loc_stack.push(loc.clone());
@@ -166,7 +175,7 @@ impl TranslationError {
         }
     }
 
-    pub fn add_loc(mut self, loc: Option<DisplaySrcLoc>) -> Self {
+    pub fn add_loc(mut self, loc: Option<DisplaySrcSpan>) -> Self {
         if let Some(loc) = loc {
             self.loc.push(loc);
         }

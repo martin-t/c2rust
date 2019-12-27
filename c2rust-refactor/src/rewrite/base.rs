@@ -15,8 +15,8 @@
 //! `[T]` implementation.
 use rustc_target::spec::abi::Abi;
 use syntax::ast::*;
-use syntax::parse::token::{DelimToken, Nonterminal, Token};
-use syntax::parse::token::{Lit as TokenLit, LitKind as TokenLitKind};
+use syntax::token::{BinOpToken, DelimToken, Nonterminal, Token, TokenKind};
+use syntax::token::{Lit as TokenLit, LitKind as TokenLitKind};
 use syntax::source_map::{Span, SyntaxContext};
 use syntax::tokenstream::{DelimSpan, TokenStream, TokenTree};
 use syntax::ThinVec;
@@ -128,7 +128,7 @@ impl SeqItem for Attribute {
     }
 }
 
-impl SeqItem for Arg {
+impl SeqItem for Param {
     fn seq_item_id(&self) -> SeqItemId {
         SeqItemId::Node(self.id)
     }
@@ -167,7 +167,7 @@ impl<A: Rewrite, B: Rewrite> MaybeRewriteSeq for (A, B) {}
 pub fn rewrite_seq_unsupported<T: Rewrite>(old: &[T], new: &[T], mut rcx: RewriteCtxtRef) -> bool {
     if old.len() != new.len() {
         // Give up - hope to recover at a higher level
-        return false;
+        false
     } else {
         for i in 0..old.len() {
             if !Rewrite::rewrite(&old[i], &new[i], rcx.borrow()) {
@@ -191,7 +191,7 @@ where
     T: SeqItem + print::RewriteAt + print::Splice + print::PrintParse + print::RecoverChildren + Rewrite + Debug,
     R: AstDeref<Target = T>,
 {
-    if old.len() == 0 && new.len() != 0 && !is_rewritable(outer_span) {
+    if old.is_empty() && !new.is_empty() && !is_rewritable(outer_span) {
         // We can't handle this case because it provides us with no span information about the
         // `old` side.  We need at least one span so we know where to splice in any new items.
         return false;
@@ -220,8 +220,7 @@ where
             diff::Result::Left(_) => {
                 // There's an item on the left corresponding to nothing on the right.
                 // Delete the item from the left.
-                let old_span = rewind_span_over_whitespace(ast(&old[i]).splice_span(), &rcx);
-                // let old_span = ast(&old[i]).splice_span();
+                let old_span = ast(&old[i]).splice_span();
                 let old_span = match old_ids[i] {
                     SeqItemId::Node(id) => extend_span_comments(&id, old_span, &rcx),
                     _ => old_span,
@@ -336,7 +335,7 @@ where
                 rcx.record(TextRewrite::new(old_span, DUMMY_SP));
                 i += 1;
 
-                if i == old.len() && !has_trailing_comma {
+                if i > 1 && i == old.len() && !has_trailing_comma {
                     comma_before = false;
                 }
             }
@@ -413,7 +412,7 @@ pub fn binop_left_prec(op: &BinOp) -> ExprPrec {
     };
 
     match assoc_op {
-        AssocOp::Less | AssocOp::LessEqual => ExprPrec::LeftLess(prec),
+        AssocOp::Less | AssocOp::LessEqual | AssocOp::ShiftLeft => ExprPrec::LeftLess(prec),
         _ => ExprPrec::Normal(prec),
     }
 }
@@ -438,9 +437,7 @@ pub fn binop_right_prec(op: &BinOp) -> ExprPrec {
 /// Note that this does not require the source text to exist in a real (non-virtual) file - there
 /// just has to be text somewhere in the `SourceMap`.
 pub fn is_rewritable(sp: Span) -> bool {
-    sp != DUMMY_SP &&
-    // If it has a non-default SyntaxContext, it was generated as part of a macro expansion.
-    sp.ctxt() == SyntaxContext::empty()
+    sp != DUMMY_SP && !sp.from_expansion()
 }
 
 pub fn describe(sess: &Session, span: Span) -> String {
@@ -482,7 +479,7 @@ pub fn extend_span_comments(id: &NodeId, span: Span, rcx: &RewriteCtxt) -> Span 
 
 /// Extend a node span to cover comments around it.  Returns Ok(span) if all
 /// comments were covered, and Err(span) if only some could be covered.
-pub fn extend_span_comments_strict(id: &NodeId, span: Span, rcx: &RewriteCtxt) -> Result<Span, Span> {
+pub fn extend_span_comments_strict(id: &NodeId, mut span: Span, rcx: &RewriteCtxt) -> Result<Span, Span> {
     let source_map = rcx.session().source_map();
 
     let comments = match rcx.comments().get(id) {
@@ -491,7 +488,12 @@ pub fn extend_span_comments_strict(id: &NodeId, span: Span, rcx: &RewriteCtxt) -
         None => return Ok(span),
     };
 
-    debug!("Extending span comments for {:?} for comments: {:?}", span, comments);
+    debug!(
+        "Extending span comments for {:?} ({:?}) for comments: {:?}",
+        span,
+        id,
+        comments.iter().map(|comment| comment.lines.clone()).collect::<Vec<_>>(),
+    );
 
     let mut before = vec![];
     let mut after = vec![];
@@ -516,11 +518,15 @@ pub fn extend_span_comments_strict(id: &NodeId, span: Span, rcx: &RewriteCtxt) -
 
     let mut all_matched = true;
 
-    let mut span = rewind_span_over_whitespace(span, rcx);
     for comment in &before {
-        let comment_size = usize::sum(comment.lines.iter().map(|l| l.len()));
-        let comment_start = BytePos::from_usize(span.lo().to_usize() - comment_size);
-        let comment_span = span.shrink_to_lo().with_lo(comment_start);
+        let cur_span = rewind_span_over_whitespace(span, rcx);
+
+        // Count the number of characters, including newlines between lines, but
+        // not the final newline.
+        let comment_size = usize::sum(comment.lines.iter().map(|l| l.len()+1)) - 1;
+
+        let comment_start = BytePos::from_usize(cur_span.lo().to_usize() - comment_size);
+        let comment_span = cur_span.shrink_to_lo().with_lo(comment_start);
         let source = match source_map.span_to_snippet(comment_span) {
             Ok(snippet) => snippet,
             Err(_) => {
@@ -529,15 +535,14 @@ pub fn extend_span_comments_strict(id: &NodeId, span: Span, rcx: &RewriteCtxt) -
             }
         };
         let matches = source.lines().zip(&comment.lines).all(|(src_line, comment_line)| {
+            if src_line.trim() != comment_line.trim() {
+                debug!("comment {:?} did not match source {:?}", comment_line, src_line);
+            }
             src_line.trim() == comment_line.trim()
         });
         if matches {
-            // Extend to previous newline because this is an isolated comment
-            let comment_span = rewind_span_over_whitespace(comment_span, rcx);
-
-            span = span.with_lo(comment_span.lo());
+            span = cur_span.with_lo(comment_span.lo());
         } else {
-            debug!("comment {:?} did not match source {:?}", comment, source);
             all_matched = false;
             break;
         }

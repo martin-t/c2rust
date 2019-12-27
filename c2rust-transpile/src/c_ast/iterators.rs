@@ -1,6 +1,6 @@
 use crate::c_ast::*;
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
 pub enum SomeId {
     Stmt(CStmtId),
     Expr(CExprId),
@@ -59,6 +59,13 @@ fn immediate_expr_children(kind: &CExprKind) -> Vec<SomeId> {
         | Choose(_, c, t, e, _) => intos![c, t, e],
         BinaryConditional(_, c, t) => intos![c, t],
         InitList(_, ref xs, _, _) => xs.iter().map(|&x| x.into()).collect(),
+        Atomic { ptr, order, val1, order_fail, val2, weak, ..} => {
+            [Some(ptr), Some(order), val1, order_fail, val2, weak]
+                .iter()
+                .flatten()
+                .map(|&x| x.into())
+                .collect()
+        }
         ImplicitCast(_, e, _, _, _)
         | ExplicitCast(_, e, _, _, _)
         | Member(_, e, _, _, _)
@@ -104,6 +111,13 @@ fn immediate_expr_children_all_types(kind: &CExprKind) -> Vec<SomeId> {
         | Choose(_, c, t, e, _) => intos![c, t, e],
         BinaryConditional(_, c, t) => intos![c, t],
         InitList(_, ref xs, _, _) => xs.iter().map(|&x| x.into()).collect(),
+        Atomic { ptr, order, val1, order_fail, val2, weak, ..} => {
+            [Some(ptr), Some(order), val1, order_fail, val2, weak]
+                .iter()
+                .flatten()
+                .map(|&x| x.into())
+                .collect()
+        }
         Member(_, e, _, _, _) | Predefined(_, e) => intos![e],
         // Normally we don't step into the result type annotation field, because it's not really
         // part of the expression.  But for `ExplicitCast`, the result type is actually the cast's
@@ -291,7 +305,7 @@ fn immediate_children(context: &TypedAstContext, s_or_e: SomeId) -> Vec<SomeId> 
     }
 }
 
-fn immediate_children_all_types(context: &TypedAstContext, s_or_e: SomeId) -> Vec<SomeId> {
+pub fn immediate_children_all_types(context: &TypedAstContext, s_or_e: SomeId) -> Vec<SomeId> {
     match s_or_e {
         SomeId::Stmt(stmt_id) => immediate_stmt_children(&context[stmt_id].kind),
         SomeId::Expr(expr_id) => immediate_expr_children_all_types(&context[expr_id].kind),
@@ -369,5 +383,45 @@ impl<'context> Iterator for DFNodes<'context> {
         }
 
         result
+    }
+}
+
+struct VisitNode {
+    id: SomeId,
+    seen: bool,
+}
+
+impl VisitNode {
+    fn new(id: SomeId) -> Self {
+        Self {
+            id,
+            seen: false,
+        }
+    }
+}
+
+pub trait NodeVisitor {
+    /// Visit nodes in pre-order traversal. Returns true if we should traverse
+    /// children. If we are not traversing children, the node will still be
+    /// visited by `post`.
+    fn pre(&mut self, _id: SomeId) -> bool { true }
+    fn post(&mut self, _id: SomeId) {}
+    fn visit_tree(&mut self, context: &TypedAstContext, root: SomeId) {
+        let mut stack = vec![VisitNode::new(root)];
+        while let Some(mut node) = stack.pop() {
+            if !node.seen {
+                let id = node.id;
+                node.seen = true;
+                stack.push(node);
+
+                if self.pre(id) {
+                    let children = immediate_children_all_types(context, id);
+                    // Add children in reverse order since we visit the end of the stack first
+                    stack.extend(children.into_iter().rev().map(VisitNode::new));
+                }
+            } else {
+                self.post(node.id);
+            }
+        }
     }
 }
