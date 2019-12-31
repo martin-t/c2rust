@@ -1697,14 +1697,14 @@ impl Builder {
         )
     }
 
-    pub fn mac_item2<I, M>(self, name: I, mac: M) -> P<Item>
+    pub fn macro_def_item<I, M>(self, name: I, macro_def: M) -> P<Item>
     where
         I: Make<Ident>,
-        M: Make<Mac>,
+        M: Make<MacroDef>,
     {
         let name = name.make(&self);
-        let mac = mac.make(&self);
-        let kind = ItemKind::Mac(mac);
+        let macro_def = macro_def.make(&self);
+        let kind = ItemKind::MacroDef(macro_def);
         Self::item(
             name,
             self.attrs,
@@ -2291,6 +2291,22 @@ impl Builder {
             path: func,
             args: P(args),
             prior_type_ascription: None,
+        }
+    }
+
+    pub fn macro_def<Ts>(self, arguments: Ts, delim: MacDelimiter, legacy: bool) -> MacroDef
+    where
+        Ts: Make<TokenStream>,
+    {
+        let args = MacArgs::Delimited(
+            DelimSpan::dummy(),
+            delim,
+            arguments.make(&self),
+        );
+
+        MacroDef {
+            body: P(args),
+            legacy,
         }
     }
 
